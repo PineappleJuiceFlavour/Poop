@@ -1,0 +1,14 @@
+model,source,blocks,triangles,textures
+grappling_device_jc2_default__rico_jc2_grapple_body_lod1,C:\Users\Admin\Downloads\JCtools\files\editor\entities\jc_props\grappling_device\grappling_device_jc2_default.ee:models/jc_characters/main_characters/rico/rico_jc2_grapple_body_lod1.rbm,1,8278,1
+grappling_device_jc3_default__rico_jc3_grapple_body_lod1,C:\Users\Admin\Downloads\JCtools\files\editor\entities\jc_props\grappling_device\grappling_device_jc3_default.ee:models/jc_characters/main_characters/rico/rico_jc3_grapple_body_lod1.rbm,1,7188,1
+grapplinghookwire__jc2_grapple_end_a_lod1,C:\Users\Admin\Downloads\JCtools\files\editor\entities\gameobjects\grapplinghookwire.ee:models/jc_weapons/grapple/grapple_end/jc2_grapple_end_a_lod1.rbm,1,540,1
+grapplinghookwire__grapple_head_body_lod1,C:\Users\Admin\Downloads\JCtools\files\editor\entities\gameobjects\grapplinghookwire.ee:models/jc_weapons/grapple/grapple_end/grapple_head_body_lod1.rbm,1,192,1
+rico_preview__rico_body_lod1,C:\Users\Admin\Downloads\JCtools\files\editor\entities\jc_characters\previewer\rico_preview.ee:models/jc_characters/main_characters/rico/rico_body_lod1.rbm,7,83601,7
+rico_preview__parachute_parachute_lod1,C:\Users\Admin\Downloads\JCtools\files\editor\entities\jc_characters\previewer\rico_preview.ee:models/jc_aero/parachute/parachute_parachute_lod1.rbm,3,16708,3
+rico_preview__wingsuit_body_lod1,C:\Users\Admin\Downloads\JCtools\files\editor\entities\jc_characters\previewer\rico_preview.ee:models/jc_aero/wingsuit/wingsuit_body_lod1.rbm,1,7201,1
+rico_preview__animation_prop_b_rico_charge_lod1,C:\Users\Admin\Downloads\JCtools\files\editor\entities\jc_characters\previewer\rico_preview.ee:models/jc_environments/props/animation_prop/animation_prop_b_rico_charge_lod1.rbm,1,1073,1
+wgst002_skin_flame__wingsuit_dlc_body_lod1,C:\Users\Admin\Downloads\JCtools\files\editor\entities\dlc\wingsuit_skins\wgst002_skin_flame.ee:models/jc_aero/wingsuit/wingsuit_dlc_body_lod1.rbm,1,7201,1
+wingsuit_skin_debugvariation__wingsuit_var_debug_lod1,C:\Users\Admin\Downloads\JCtools\files\editor\entities\dlc\wingsuit_skins\wingsuit_skin_debugvariation.ee:models/jc_aero/wingsuit/variants/debug/wingsuit_var_debug_lod1.rbm,1,7201,1
+para002_skin_flame__parachute_dlc_parachute_lod1,C:\Users\Admin\Downloads\JCtools\files\editor\entities\dlc\parachute_skins\para002_skin_flame.ee:models/jc_aero/parachute/parachute_dlc_parachute_lod1.rbm,3,16708,3
+parachute_skin_debugvariation__parachute_var_debug_lod1,C:\Users\Admin\Downloads\JCtools\files\editor\entities\dlc\parachute_skins\parachute_skin_debugvariation.ee:models/jc_aero/parachute/variants/debug/parachute_var_debug_lod1.rbm,1,23604,1
+rico_skin_debugvariation__rico_var_debug_lod1,C:\Users\Admin\Downloads\JCtools\files\editor\entities\dlc\rico_skins\rico_skin_debugvariation.ee:models/jc_characters/main_characters/rico/variants/debug/rico_var_debug_lod1.rbm,1,67150,1
