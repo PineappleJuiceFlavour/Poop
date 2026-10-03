@@ -1,0 +1,11 @@
+key,type,value,feature,note
+GRAPPLE_RANGE,float,100.0,grapple,max hook distance (m)
+GRAPPLE_PULL,float,38.0,grapple,pull speed (m/s)
+GRAPPLE_STOP_DIST,float,2.5,grapple,release distance (m)
+WINGSUIT_GLIDE,float,0.22,wingsuit,forward lift per tick
+WINGSUIT_SINK,float,-6.0,wingsuit,max fall speed while gliding
+WINGSUIT_SPEED,float,42.0,wingsuit,glide speed (m/s)
+CHUTE_BOOST,float,20.0,parachute,grapple-into-chute boost (m/s)
+INFINITE_CHUTES,bool,1,parachute,re-give parachute every tick
+CHAOS_EXPLOSION_TYPE,int,2,chaos,explosion type on grapple+jump
+CHAOS_DAMAGE,float,1.0,chaos,

@@ -1,0 +1,7 @@
+id,feature,source_jc3,gta5_mapping,natives_used,status
+1,grapple,Rico grappling hook pull,LOS probe from cam; set velocity toward hit,GET_GAMEPLAY_CAM_COORD;GET_GAMEPLAY_CAM_ROT;START_EXPENSIVE_SYNCHRONOUS_SHAPE_TEST_LOS_PROBE;GET_SHAPE_TEST_RESULT;SET_ENTITY_VELOCITY;DRAW_LINE,implemented
+2,wingsuit,Wingsuit glide,in-air velocity override along cam heading,IS_ENTITY_IN_AIR;GET_ENTITY_VELOCITY;SET_ENTITY_VELOCITY;GET_GAMEPLAY_CAM_ROT,implemented
+3,parachute,Infinite parachutes + grapple boost,re-give GADGET_PARACHUTE; boost while chute open,GIVE_WEAPON_TO_PED;GET_PED_PARACHUTE_STATE,implemented
+4,chaos,C4-style detonation at hook point,explosion at last grapple hit,ADD_EXPLOSION,implemented
+5,tether,Tether two objects,,,unimplemented
+6,rebel_drop,Supply drop vehicles,,,unimplemented
