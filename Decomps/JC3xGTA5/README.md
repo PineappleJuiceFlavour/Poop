@@ -41,14 +41,16 @@ Any row left empty just switches its feature off (ReShade's log names what's mis
 compositing need no symbols at all.
 
 ## Setup
-1. Install ReShade 6.8+ **with full add-on support** into both games (DirectX 11). `play.bat` moves GTA's
-   `dxgi.dll` to `ReShade64.asi`, because GTA loads the system dxgi first.
-2. Install ScriptHookV (`ScriptHookV.dll`, `dinput8.dll`) into GTA 5, and unzip its SDK into `gta\sdk\`.
-3. ReShade depth settings in **both** games: `RESHADE_DEPTH_INPUT_IS_REVERSED=1`,
-   `RESHADE_DEPTH_LINEARIZATION_FAR_PLANE=1000`. Enable `JC3Export` in JC3 (last in the list) and
-   `JC3Passthrough` in GTA.
-4. Pick where Los Santos sits in Medici: `JC3_ORIGIN_X/Y/Z` in `tuning.csv`.
-5. Run both windowed, with GTA's "Pause game on focus loss" off. Run `play.bat` from the repo root.
+1. Install Visual Studio 2022 (C++ desktop), CMake, Python 3 and Git.
+2. Run `play.bat` from the repo root. The first run downloads ScriptHookV, its SDK and ReShade (add-on build)
+   from their official sites and installs them: the SDK into `gta\sdk\`, ScriptHookV + ReShade (as
+   `ReShade64.asi`) into GTA 5, ReShade (as `dxgi.dll`) into JC3. It also writes `ReShade.ini` and
+   `ReShadePreset.ini` with the depth settings and the right effect turned on (only if you have none).
+   Then it builds, installs and launches both games.
+3. Pick where Los Santos sits in Medici: `JC3_ORIGIN_X/Y/Z` in `tuning.csv`.
+4. Run both windowed, with GTA's "Pause game on focus loss" off.
+
+`Decomps\tools\run_ghidra.bat` likewise downloads Ghidra and a JDK into `Decomps\local\tools` the first time.
 
 ## Controls (in GTA)
 | key | action |
