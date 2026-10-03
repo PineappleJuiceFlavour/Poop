@@ -1,9 +1,0 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net9.0</TargetFramework><Nullable>disable</Nullable><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
-  <ItemGroup>
-    <Reference Include="JustCause.Archives.Core"><HintPath>C:\Users\Admin\Downloads\JCtools\tools\RBMesh\JustCause.Archives.Core.dll</HintPath></Reference>
-    <Reference Include="JustCause.Models.Core"><HintPath>C:\Users\Admin\Downloads\JCtools\tools\RBMesh\JustCause.Models.Core.dll</HintPath></Reference>
-    <Reference Include="JustCause.Textures.Core"><HintPath>C:\Users\Admin\Downloads\JCtools\tools\RBMesh\JustCause.Textures.Core.dll</HintPath></Reference>
-    <Reference Include="JustCause.Adf.Core"><HintPath>C:\Users\Admin\Downloads\JCtools\tools\RBMesh\JustCause.Adf.Core.dll</HintPath></Reference>
-  </ItemGroup>
-</Project>
