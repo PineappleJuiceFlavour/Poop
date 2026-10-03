@@ -5,8 +5,8 @@ id,feature,side,source_jc3,gta5_mapping,needs_symbols,status
 4,chaos,gta,C4 detonation at hook point,explosion at last grapple hit + mirrored to JC3,,implemented
 5,frame_export,jc3,JC3 colour+depth,ReShade add-on in JC3 -> shared memory,,implemented
 6,composite,gta,JC3 drawn into GTA,ReShade add-on + JC3Passthrough.fx depth test vs GTA depth,,implemented
-7,camera_sync,jc3,JC3 camera follows GTA camera,post-hook CameraUpdate and overwrite matrix,0;1;2;3;4,implemented_needs_symbols
-8,rico_sync,jc3,Rico stands where GTA player stands,write character matrix,5;6;7,implemented_needs_symbols
+7,camera_sync,jc3,JC3 camera follows GTA camera,overwrite auto-found camera matrices + fov (thread; CameraUpdate hook if filled),0;1;2;3;11;12,implemented_public_addresses
+8,rico_sync,jc3,Rico stands where GTA player stands,write character matrix,5;6;7;8;11,implemented_public_addresses
 9,explosions,both,explosions cross over,ExplosionCtor hook -> ADD_EXPLOSION; GTA -> SpawnExplosion,8;9,implemented_needs_symbols
 10,tether,gta,Tether two objects,,,unimplemented
 11,rebel_drop,gta,Supply drop vehicles,,,unimplemented

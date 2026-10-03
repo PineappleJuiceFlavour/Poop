@@ -1,11 +1,14 @@
 id,name,kind,pattern,rip_offset,extra_offset,feature,status,how_to_find
-0,CameraManager,rip_ptr,,3,0,camera_sync,needs_ghidra,"global pointer read at the start of the camera update; Ghidra: tools/ghidra/FindJC3Symbols.py lists RTTI ""CCameraManager"" and its xref'd globals"
-1,Camera_Transform,offset,,0,0,camera_sync,needs_ghidra,offset of the active camera's 4x4 world matrix inside the active camera object
-2,Camera_Active,offset,,0,0,camera_sync,needs_ghidra,offset of the active camera pointer inside CameraManager
-3,Camera_Fov,offset,,0,0,camera_sync,needs_ghidra,offset of vertical fov (radians) in the camera object
-4,CameraUpdate,function,,0,0,camera_sync,needs_ghidra,function that writes the camera matrix each frame (we post-hook it and overwrite)
-5,PlayerManager,rip_ptr,,3,0,rico_sync,needs_ghidra,"global pointer, RTTI ""CPlayerManager"""
-6,LocalCharacter,offset,,0,0,rico_sync,needs_ghidra,offset of local character pointer inside PlayerManager
-7,Character_Transform,offset,,0,0,rico_sync,needs_ghidra,offset of 4x4 world matrix inside the character
-8,SpawnExplosion,function,,0,0,explosions,needs_ghidra,"called by C4/barrels; signature (this?, const vec3* pos, ...) - log one call in x64dbg to confirm args"
-9,ExplosionCtor,function,,0,0,explosions,needs_ghidra,hooked to report JC3 explosions back to GTA
+0,CameraManager,abs,0x142ED0E20,0,0,camera_sync,public,"global CCameraManager* (Steam 1.05 / current build). Source: BakuStorm/JC3FOVFixer + Mrsuss60/JustC3_FOVChanger. Pattern if it moves: 48 8B 05 ?? ?? ?? ?? F3 0F 10 05 ?? ?? ?? ?? 4D 89 C1 48 8B 90 (rip_ptr, rip_offset 3)"
+1,Camera_Transform,auto,,0,0,camera_sync,auto,"found at runtime: offsets in the active camera holding an orthonormal 4x4 whose position is near Rico (logged to ReShade.log; paste one here as an offset row to pin it)"
+2,Camera_Active,offset,0x5C0,0,0,camera_sync,public,"current camera pointer in CCameraManager (JC3FOVFixer, JustC3_FOVChanger)"
+3,Camera_Fov,offset,0x580,0,0,camera_sync,public,"vertical fov radians; also +4 and +8 (JustC3_FOVChanger)"
+4,CameraUpdate,function,,0,0,camera_sync,optional,"optional: the function writing Camera_Transform each frame. Without it the add-on overwrites the camera from its own thread (can flicker). Ghidra: find writers of [reg+Camera_Transform]"
+5,PlayerManager,abs,0x142F36958,0,0,rico_sync,public,"global CNetworkPlayerManager* (aaronkirkham/jc3-console-thingy)"
+6,LocalPlayer,offset,0x48,0,0,rico_sync,public,"CNetworkPlayer* in CNetworkPlayerManager (jc3-console-thingy)"
+7,LocalCharacter,offset,0x138,0,0,rico_sync,public,"CCharacter* (shared_ptr) in CNetworkPlayer (jc3-console-thingy: m_character after m_player at 0x128)"
+8,Character_Transform,offset,0x2830,0,0,rico_sync,public,"CMatrix4f in CCharacter, rows, position in row 3, y up (jc3-console-thingy)"
+9,SpawnExplosion,function,,0,0,explosions,needs_ghidra,"called by C4/barrels; extra_offset = index of the vec3* argument. Not public anywhere"
+10,ExplosionCtor,function,,0,0,explosions,needs_ghidra,"unused for now"
+11,VersionCheck,abs,0x142305658,0,0x6C617641,all,public,"must read 'Aval' (0x6C617641) or every abs row is switched off (jc3-console-thingy's check)"
+12,Camera_Flags,offset,0x55E,0,16,camera_sync,public,"byte; OR with extra_offset (0x10) after changing fov (JC3FOVFixer)"

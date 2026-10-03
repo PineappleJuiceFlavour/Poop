@@ -4,6 +4,7 @@
 //    and swaps explosions both ways.
 #include <windows.h>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <reshade.hpp>
 #include <MinHook.h>
@@ -28,13 +29,65 @@ static void write_matrix(float* m, const float fwd[3], const float up[3], const 
     std::memcpy(m, rows, sizeof rows);
 }
 
+static uintptr_t read_ptr(uintptr_t p) { return sym::readable(p, 8) ? *reinterpret_cast<uintptr_t*>(p) : 0; }
 static uintptr_t active_camera() {
-    uintptr_t mgr = *reinterpret_cast<uintptr_t*>(sym::v(sym::CameraManager));
-    return mgr ? *reinterpret_cast<uintptr_t*>(mgr + sym::v(sym::Camera_Active)) : 0;
+    uintptr_t mgr = read_ptr(sym::v(sym::CameraManager));
+    return mgr ? read_ptr(mgr + sym::v(sym::Camera_Active)) : 0;
 }
 static uintptr_t local_character() {
-    uintptr_t mgr = *reinterpret_cast<uintptr_t*>(sym::v(sym::PlayerManager));
-    return mgr ? *reinterpret_cast<uintptr_t*>(mgr + sym::v(sym::LocalCharacter)) : 0;
+    uintptr_t mgr = read_ptr(sym::v(sym::PlayerManager));
+    uintptr_t ply = mgr ? read_ptr(mgr + sym::v(sym::LocalPlayer)) : 0;
+    return ply ? read_ptr(ply + sym::v(sym::LocalCharacter)) : 0;
+}
+
+// Camera matrix offsets inside the active camera: from the sheet, or found by calibrate().
+static int g_cam_offsets[4] = {}, g_cam_count = 0;
+static uintptr_t g_calibrated_for = 0;
+
+static bool looks_like_camera(const float* m, const float* rico) {
+    for (int r = 0; r < 3; ++r) {
+        float l = m[r * 4] * m[r * 4] + m[r * 4 + 1] * m[r * 4 + 1] + m[r * 4 + 2] * m[r * 4 + 2];
+        if (!(l > 0.96f && l < 1.04f) || std::fabs(m[r * 4 + 3]) > 1e-3f) return false;
+    }
+    if (std::fabs(m[15] - 1.f) > 1e-3f) return false;
+    float dx = m[12] - rico[12], dy = m[13] - rico[13], dz = m[14] - rico[14];
+    return dx * dx + dy * dy + dz * dz < 30.f * 30.f; // the third-person camera stays near Rico
+}
+
+// Scan the camera object for every world matrix near Rico (JC3 keeps several copies of the view).
+static void calibrate(uintptr_t cam) {
+    if (sym::ok(sym::Camera_Transform)) { g_cam_offsets[0] = int(sym::v(sym::Camera_Transform)); g_cam_count = 1; return; }
+    uintptr_t ch = local_character();
+    if (!ch || cam == g_calibrated_for || !sym::readable(cam, 0x1000) || !sym::readable(ch + sym::v(sym::Character_Transform), 64)) return;
+    const float* rico = reinterpret_cast<const float*>(ch + sym::v(sym::Character_Transform));
+    g_cam_count = 0;
+    for (int off = 0; off + 64 <= 0x1000 && g_cam_count < 4; off += 4)
+        if (looks_like_camera(reinterpret_cast<const float*>(cam + off), rico)) {
+            g_cam_offsets[g_cam_count++] = off;
+            char msg[96]; sprintf_s(msg, "JC3xGTA5: camera matrix candidate at +0x%X", off);
+            reshade::log::message(reshade::log::level::info, msg);
+            off += 60;
+        }
+    g_calibrated_for = cam;
+}
+
+static void apply_camera() {
+    if (!g_s || !bridge::alive(g_s->header.gta_heartbeat) || !(g_s->player.flags & 1)) return;
+    uintptr_t cam = active_camera();
+    if (!cam) return;
+    calibrate(cam);
+    uint64_t seq = g_s->cam.seq;
+    if (seq & 1) return;
+    B::Cam_t c = g_s->cam;
+    if (g_s->cam.seq != seq) return;
+    for (int i = 0; i < g_cam_count; ++i)
+        write_matrix(reinterpret_cast<float*>(cam + g_cam_offsets[i]), c.fwd, c.up, c.pos);
+    const float fov = c.fov * 3.14159265f / 180.f;
+    float* f = reinterpret_cast<float*>(cam + sym::v(sym::Camera_Fov));
+    if (f[0] != fov) {
+        f[0] = f[1] = f[2] = fov;
+        if (sym::ok(sym::Camera_Flags)) *reinterpret_cast<uint8_t*>(cam + sym::v(sym::Camera_Flags)) |= uint8_t(sym::rows[sym::Camera_Flags].extra);
+    }
 }
 
 // Generic 4-register-arg post-hook: let JC3 update its camera, then overwrite with GTA's.
@@ -42,18 +95,15 @@ using Fn4 = void*(__fastcall*)(void*, void*, void*, void*);
 static Fn4 o_camera_update = nullptr;
 static void* __fastcall hk_camera_update(void* a, void* b, void* c, void* d) {
     void* ret = o_camera_update(a, b, c, d);
-    if (g_s && bridge::alive(g_s->header.gta_heartbeat) && (g_s->player.flags & 1)) {
-        uint64_t seq = g_s->cam.seq;
-        if (!(seq & 1)) {
-            B::Cam_t cam = g_s->cam;
-            if (g_s->cam.seq == seq)
-                if (uintptr_t c0 = active_camera()) {
-                    write_matrix(reinterpret_cast<float*>(c0 + sym::v(sym::Camera_Transform)), cam.fwd, cam.up, cam.pos);
-                    *reinterpret_cast<float*>(c0 + sym::v(sym::Camera_Fov)) = cam.fov * 3.14159265f / 180.f;
-                }
-        }
-    }
+    apply_camera();
     return ret;
+}
+
+// Without a CameraUpdate hook, keep overwriting the camera from a thread (races the game; may flicker).
+static volatile bool g_run = true;
+static DWORD WINAPI camera_thread(LPVOID) {
+    while (g_run) { if (g_s) apply_camera(); SwitchToThread(); }
+    return 0;
 }
 
 // SpawnExplosion: report every JC3 explosion to GTA, and remember the call so GTA explosions can be replayed.
@@ -91,7 +141,7 @@ static void hook(sym::Id id, void* detour, Fn4* orig) {
 // ---------- per-frame work (game's render thread, inside ReShade's present) ----------
 static void sync_world() {
     g_s->header.jc3_heartbeat = GetTickCount64();
-    if (sym::all({sym::PlayerManager, sym::LocalCharacter, sym::Character_Transform}))
+    if (sym::all({sym::PlayerManager, sym::LocalPlayer, sym::LocalCharacter, sym::Character_Transform}))
         if (uintptr_t ch = local_character()) {
             auto* m = reinterpret_cast<float*>(ch + sym::v(sym::Character_Transform));
             if (bridge::alive(g_s->header.gta_heartbeat) && (g_s->player.flags & 2)) {
@@ -172,8 +222,10 @@ static void init_hooks(HMODULE mod) {
     uint32_t mask = sym::load(csv);
     if ((g_s = bridge::open())) g_s->header.jc3_symbols_ok = mask;
     MH_Initialize();
-    if (sym::all({sym::CameraManager, sym::Camera_Active, sym::Camera_Transform, sym::Camera_Fov, sym::CameraUpdate}))
-        hook(sym::CameraUpdate, &hk_camera_update, &o_camera_update);
+    if (sym::all({sym::CameraManager, sym::Camera_Active, sym::Camera_Fov})) {
+        if (sym::ok(sym::CameraUpdate)) hook(sym::CameraUpdate, &hk_camera_update, &o_camera_update);
+        else CloseHandle(CreateThread(nullptr, 0, camera_thread, nullptr, 0, nullptr));
+    }
     if (sym::ok(sym::SpawnExplosion))
         hook(sym::SpawnExplosion, &hk_spawn_explosion, &o_spawn_explosion);
 }
@@ -188,6 +240,7 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID) {
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_runtime);
         init_hooks(mod);
     } else if (reason == DLL_PROCESS_DETACH) {
+        g_run = false;
         MH_DisableHook(MH_ALL_HOOKS); MH_Uninitialize();
         reshade::unregister_addon(mod);
     }

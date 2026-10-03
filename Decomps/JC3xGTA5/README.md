@@ -24,21 +24,25 @@ GTA 5 (host)                                         Just Cause 3 (guest)
 
 `python codegen/gen.py` turns the sheets into `generated/`. Don't edit `generated/` by hand.
 
-## Filling `jc3_symbols.csv` (your Ghidra session)
-JC3 has no script hook, so camera sync, Rico sync and explosions need addresses from **your own**
-`JustCause3.exe`. Nothing from the game ships in this repo.
-1. `set GHIDRA_HOME=C:\ghidra` then `Decomps\tools\run_ghidra.bat "<JC3 folder>\JustCause3.exe" JC3`.
-   The output, `Decomps\local\JC3\`, holds functions/calls/structs/strings spreadsheets plus
-   `jc3_candidates.csv`: RTTI classes named Camera/PlayerManager/Character/Explosion, the functions that use
-   them, and a byte pattern for each.
-2. For `function` and `rip_ptr` rows, paste a unique pattern into `pattern` (`??` = wildcard). For `rip_ptr`,
-   `rip_offset` is where the 4-byte displacement starts inside the pattern.
-3. For `offset` rows, put the hex offset (e.g. `0x1A0`) in `pattern`.
-4. For `SpawnExplosion`, `extra_offset` is the index (0-3) of the argument that points at the position.
-5. Check matrix layout with a memory viewer; set `JC3_MATRIX_LAYOUT` in `tuning.csv` if needed.
+## JC3 addresses (`jc3_symbols.csv`)
+JC3 has no script hook, so the JC3 half reads the game's memory directly. The addresses come from open-source
+JC3 mods, for the final Steam build (1.05, also the current Denuvo-free build):
+- **Camera:** `CCameraManager` at `0x142ED0E20`, active camera `+0x5C0`, fov `+0x580` (radians), flags `+0x55E`.
+  From [BakuStorm/JC3FOVFixer](https://github.com/BakuStorm/JC3FOVFixer) and
+  [Mrsuss60/JustC3_FOVChanger](https://github.com/Mrsuss60/JustC3_FOVChanger).
+- **Rico:** `CNetworkPlayerManager` at `0x142F36958` → `+0x48` local player → `+0x138` character →
+  `+0x2830` world matrix. From [aaronkirkham/jc3-console-thingy](https://github.com/aaronkirkham/jc3-console-thingy).
+- **Version check:** `0x142305658` must read `Aval`, or every absolute address is switched off (other builds).
+- **Camera matrix:** not public anywhere, so the add-on finds it itself. It scans the active camera for 4x4
+  matrices near Rico and logs each offset to `ReShade.log` ("camera matrix candidate at +0x..."). It then
+  overwrites them from a background thread, which can flicker. To pin it, put a logged offset in the
+  `Camera_Transform` row (`kind` = `offset`). Filling `CameraUpdate` with that function's pattern
+  removes the flicker.
+- **Explosions crossing over:** need `SpawnExplosion`, which no public source has. Until it's filled
+  (from your Ghidra project: `tools\export_existing_project.bat`), explosions stay in GTA only.
 
-Any row left empty just switches its feature off (ReShade's log names what's missing). Frame export and
-compositing need no symbols at all.
+Rows are read at launch, so editing the sheet needs no rebuild. Any missing row switches its feature off, and
+ReShade's log names it.
 
 ## Setup
 1. Install Visual Studio 2022 (C++ desktop), CMake, Python 3 and Git.
