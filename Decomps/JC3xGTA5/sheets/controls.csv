@@ -3,3 +3,5 @@ GRAPPLE_FIRE,24,LMB / RT,just_pressed_with_aim
 GRAPPLE_AIM,25,RMB / LT,pressed
 WINGSUIT_TOGGLE,22,Space / A,just_pressed_in_air
 CHAOS_DETONATE,47,G / DPad-Left,just_pressed
+PASSTHROUGH_TOGGLE,0x76,F7,vk_key
+RICO_MIRROR_TOGGLE,0x77,F8,vk_key

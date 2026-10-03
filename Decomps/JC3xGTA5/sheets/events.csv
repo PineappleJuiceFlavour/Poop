@@ -1,0 +1,6 @@
+id,name,direction,a,b,note
+1,EXPLOSION,both,radius,power,an explosion at pos
+2,BULLET_HIT,jc3_to_gta,damage,,a JC3 bullet landed at pos
+3,VEHICLE_DESTROYED,both,model_hash,,
+4,TELEPORT,gta_to_jc3,heading,,move Rico to pos
+5,GRAPPLE_HIT,gta_to_jc3,,,GTA grapple anchor point

@@ -7,5 +7,12 @@ WINGSUIT_SINK,float,-6.0,wingsuit,max fall speed while gliding
 WINGSUIT_SPEED,float,42.0,wingsuit,glide speed (m/s)
 CHUTE_BOOST,float,20.0,parachute,grapple-into-chute boost (m/s)
 INFINITE_CHUTES,bool,1,parachute,re-give parachute every tick
-CHAOS_EXPLOSION_TYPE,int,2,chaos,explosion type on grapple+jump
+CHAOS_EXPLOSION_TYPE,int,2,chaos,explosion type on detonate / mirrored JC3 explosions
 CHAOS_DAMAGE,float,1.0,chaos,
+JC3_ORIGIN_X,double,0.0,coords,JC3 x for GTA (0 0 0); pick a spot in Medici and set these
+JC3_ORIGIN_Y,double,0.0,coords,JC3 height (y-up) for GTA z=0
+JC3_ORIGIN_Z,double,0.0,coords,JC3 z for GTA (0 0 0)
+COMPOSITE_MAX_DIST,float,80.0,composite,JC3 pixels farther than this (m) are dropped so JC3 terrain doesn't cover Los Santos
+FRAME_MAX_PIXELS,int,2073600,composite,cap on exported frame size (1080p)
+PASSTHROUGH_START_ON,bool,1,bridge,start with the passthrough on
+JC3_MATRIX_LAYOUT,int,0,camera_sync,"JC3 matrix rows: 0 = right,up,back,pos  1 = right,up,forward,pos (check in a memory viewer)"

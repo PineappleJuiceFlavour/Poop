@@ -1,7 +1,12 @@
-id,feature,source_jc3,gta5_mapping,natives_used,status
-1,grapple,Rico grappling hook pull,LOS probe from cam; set velocity toward hit,GET_GAMEPLAY_CAM_COORD;GET_GAMEPLAY_CAM_ROT;START_EXPENSIVE_SYNCHRONOUS_SHAPE_TEST_LOS_PROBE;GET_SHAPE_TEST_RESULT;SET_ENTITY_VELOCITY;DRAW_LINE,implemented
-2,wingsuit,Wingsuit glide,in-air velocity override along cam heading,IS_ENTITY_IN_AIR;GET_ENTITY_VELOCITY;SET_ENTITY_VELOCITY;GET_GAMEPLAY_CAM_ROT,implemented
-3,parachute,Infinite parachutes + grapple boost,re-give GADGET_PARACHUTE; boost while chute open,GIVE_WEAPON_TO_PED;GET_PED_PARACHUTE_STATE,implemented
-4,chaos,C4-style detonation at hook point,explosion at last grapple hit,ADD_EXPLOSION,implemented
-5,tether,Tether two objects,,,unimplemented
-6,rebel_drop,Supply drop vehicles,,,unimplemented
+id,feature,side,source_jc3,gta5_mapping,needs_symbols,status
+1,grapple,gta,Rico grappling hook pull,LOS probe from cam; velocity toward hit,,implemented
+2,wingsuit,gta,Wingsuit glide,in-air velocity along cam heading,,implemented
+3,parachute,gta,Infinite parachutes + grapple boost,re-give GADGET_PARACHUTE,,implemented
+4,chaos,gta,C4 detonation at hook point,explosion at last grapple hit + mirrored to JC3,,implemented
+5,frame_export,jc3,JC3 colour+depth,ReShade add-on in JC3 -> shared memory,,implemented
+6,composite,gta,JC3 drawn into GTA,ReShade add-on + JC3Passthrough.fx depth test vs GTA depth,,implemented
+7,camera_sync,jc3,JC3 camera follows GTA camera,post-hook CameraUpdate and overwrite matrix,0;1;2;3;4,implemented_needs_symbols
+8,rico_sync,jc3,Rico stands where GTA player stands,write character matrix,5;6;7,implemented_needs_symbols
+9,explosions,both,explosions cross over,ExplosionCtor hook -> ADD_EXPLOSION; GTA -> SpawnExplosion,8;9,implemented_needs_symbols
+10,tether,gta,Tether two objects,,,unimplemented
+11,rebel_drop,gta,Supply drop vehicles,,,unimplemented

@@ -1,0 +1,11 @@
+id,name,kind,pattern,rip_offset,extra_offset,feature,status,how_to_find
+0,CameraManager,rip_ptr,,3,0,camera_sync,needs_ghidra,"global pointer read at the start of the camera update; Ghidra: tools/ghidra/FindJC3Symbols.py lists RTTI ""CCameraManager"" and its xref'd globals"
+1,Camera_Transform,offset,,0,0,camera_sync,needs_ghidra,offset of the active camera's 4x4 world matrix inside the active camera object
+2,Camera_Active,offset,,0,0,camera_sync,needs_ghidra,offset of the active camera pointer inside CameraManager
+3,Camera_Fov,offset,,0,0,camera_sync,needs_ghidra,offset of vertical fov (radians) in the camera object
+4,CameraUpdate,function,,0,0,camera_sync,needs_ghidra,function that writes the camera matrix each frame (we post-hook it and overwrite)
+5,PlayerManager,rip_ptr,,3,0,rico_sync,needs_ghidra,"global pointer, RTTI ""CPlayerManager"""
+6,LocalCharacter,offset,,0,0,rico_sync,needs_ghidra,offset of local character pointer inside PlayerManager
+7,Character_Transform,offset,,0,0,rico_sync,needs_ghidra,offset of 4x4 world matrix inside the character
+8,SpawnExplosion,function,,0,0,explosions,needs_ghidra,"called by C4/barrels; signature (this?, const vec3* pos, ...) - log one call in x64dbg to confirm args"
+9,ExplosionCtor,function,,0,0,explosions,needs_ghidra,hooked to report JC3 explosions back to GTA

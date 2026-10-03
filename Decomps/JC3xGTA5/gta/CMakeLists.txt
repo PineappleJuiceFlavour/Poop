@@ -1,0 +1,16 @@
+cmake_minimum_required(VERSION 3.20)
+project(JC3xGTA5_gta CXX)
+include(FetchContent)
+set(SHV_SDK "${CMAKE_SOURCE_DIR}/sdk" CACHE PATH "ScriptHookV SDK root (contains inc/ and lib/)")
+FetchContent_Declare(reshade GIT_REPOSITORY https://github.com/crosire/reshade.git GIT_TAG v6.8.0 GIT_SHALLOW TRUE
+  SOURCE_SUBDIR do-not-build)
+FetchContent_MakeAvailable(reshade)
+find_package(Python3 REQUIRED)
+add_custom_target(gen_gta ALL COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/../codegen/gen.py)
+add_library(JC3xGTA5_gta SHARED src/main.cpp src/compositor.cpp)
+add_dependencies(JC3xGTA5_gta gen_gta)
+set_target_properties(JC3xGTA5_gta PROPERTIES OUTPUT_NAME "JC3xGTA5" SUFFIX ".asi" CXX_STANDARD 20
+  MSVC_RUNTIME_LIBRARY "MultiThreaded")
+target_compile_definitions(JC3xGTA5_gta PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(JC3xGTA5_gta PRIVATE ${SHV_SDK}/inc ${reshade_SOURCE_DIR}/include)
+target_link_libraries(JC3xGTA5_gta PRIVATE ${SHV_SDK}/lib/ScriptHookV.lib)

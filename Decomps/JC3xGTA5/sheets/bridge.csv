@@ -1,0 +1,30 @@
+section,field,type,count,writer,note
+header,magic,uint32_t,1,both,0x33434A47 'GJC3'
+header,version,uint32_t,1,both,bumped by gen.py when this sheet changes
+header,gta_heartbeat,uint64_t,1,gta,GetTickCount64 of last GTA write
+header,jc3_heartbeat,uint64_t,1,jc3,GetTickCount64 of last JC3 write
+header,jc3_symbols_ok,uint32_t,1,jc3,bitmask of resolved rows in jc3_symbols.csv
+cam,seq,uint64_t,1,gta,odd while writing
+cam,pos,double,3,gta,GTA camera position in JC3 space
+cam,fwd,float,3,gta,camera forward unit vector in JC3 space
+cam,up,float,3,gta,camera up unit vector in JC3 space
+cam,fov,float,1,gta,vertical fov degrees
+player,pos,double,3,gta,GTA player feet in JC3 space
+player,fwd,float,3,gta,player facing in JC3 space
+player,flags,uint32_t,1,gta,1=active 2=rico_mirror 4=hide_gta_ped
+rico,pos,double,3,jc3,Rico position in JC3 space
+rico,flags,uint32_t,1,jc3,1=valid
+frame,publish,uint64_t,1,jc3,increments per published slot
+frame,slot,int32_t,1,jc3,newest complete slot
+frame,width,uint32_t,1,jc3,
+frame,height,uint32_t,1,jc3,
+frame,near,float,1,jc3,
+frame,far,float,1,jc3,
+frame,pose_pos,double,3,jc3,camera the frame was rendered with
+frame,pose_fwd,float,3,jc3,
+frame,pose_up,float,3,jc3,
+frame,pose_fov,float,1,jc3,
+ev_jc3,head,uint32_t,1,jc3,ring write index (events JC3 -> GTA)
+ev_jc3,items,Event,64,jc3,
+ev_gta,head,uint32_t,1,gta,ring write index (events GTA -> JC3)
+ev_gta,items,Event,64,gta,

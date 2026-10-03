@@ -1,7 +1,7 @@
 // GENERATED from sheets/natives.csv
 #pragma once
-#include "nativeCaller.h"
-#include "types.h"
+#include <nativeCaller.h>
+#include <types.h>
 namespace N {
 inline Ped PLAYER_PED_ID() { return invoke<Ped>(0xD80958FC74E988A6); }
 inline Vector3 GET_ENTITY_COORDS(Entity e, BOOL alive) { return invoke<Vector3>(0x3FEF770D40960D5A, e, alive); }
@@ -19,4 +19,9 @@ inline int GET_PED_PARACHUTE_STATE(Ped p) { return invoke<int>(0x79CFD9827CC979B
 inline void GIVE_WEAPON_TO_PED(Ped p, Hash w, int ammo, BOOL hidden, BOOL equip) { return invoke<void>(0xBF0FD6E56C964FCB, p, w, ammo, hidden, equip); }
 inline void ADD_EXPLOSION(float x, float y, float z, int type, float dmg, BOOL audible, BOOL invisible, float shake, BOOL noDamage) { return invoke<void>(0xE3AD2BDBAEE269AC, x, y, z, type, dmg, audible, invisible, shake, noDamage); }
 inline void DRAW_LINE(float x1, float y1, float z1, float x2, float y2, float z2, int r, int g, int b, int a) { return invoke<void>(0x6B7256074AE34680, x1, y1, z1, x2, y2, z2, r, g, b, a); }
+inline Vector3 GET_FINAL_RENDERED_CAM_COORD() { return invoke<Vector3>(0xA200EB1EE790F448); }
+inline Vector3 GET_FINAL_RENDERED_CAM_ROT(int order) { return invoke<Vector3>(0x5B4E4C817FCC2DFB, order); }
+inline float GET_FINAL_RENDERED_CAM_FOV() { return invoke<float>(0x80EC114669DAEFF4); }
+inline Vector3 GET_ENTITY_FORWARD_VECTOR(Entity e) { return invoke<Vector3>(0x0A794A5A57F8DF91, e); }
+inline void SET_ENTITY_VISIBLE(Entity e, BOOL visible, BOOL p2) { return invoke<void>(0xEA1C610A04DB6BBB, e, visible, p2); }
 }
