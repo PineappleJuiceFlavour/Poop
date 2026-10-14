@@ -1,0 +1,39 @@
+[package]
+name = "bevy_map_editor"
+version = "0.1.0"
+edition = "2024"
+description = "Drop-in in-game map editor for Bevy games: free cam, asset browser, drag & drop placement, collision, save/load."
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["avian"]
+# Give placed props real colliders through avian3d. Turn off if your game uses another physics engine
+# and attach colliders yourself from the `PropSpawned` event.
+avian = ["dep:avian3d"]
+
+[dependencies]
+bevy = "0.19"
+bevy_egui = "0.42"
+avian3d = { version = "0.7", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+bevy = { version = "0.19", features = ["dynamic_linking"] }
+
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3
+
+[[example]]
+name = "demo_game"
+required-features = ["avian"]
+
+[[example]]
+name = "selftest"
+required-features = ["avian"]
+
+[[example]]
+name = "library_selftest"
+required-features = ["avian"]

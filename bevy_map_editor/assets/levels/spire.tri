@@ -1,0 +1,8 @@
+tri 1
+# a made-up mesh format, standing in for a ported game's own files
+1 0 -1  -1 0 -1  0 2.5 0
+1 0 1  1 0 -1  0 2.5 0
+-1 0 1  1 0 1  0 2.5 0
+-1 0 -1  -1 0 1  0 2.5 0
+-1 0 -1  1 0 -1  1 0 1
+-1 0 -1  1 0 1  -1 0 1

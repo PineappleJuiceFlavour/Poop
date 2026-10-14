@@ -5,3 +5,7 @@ build/
 Decomps/JC3xGTA5/gta/sdk/
 Decomps/jc3_export/
 Decomps/ghidra_projects/
+
+# bevy_map_editor
+bevy_map_editor/target/
+bevy_map_editor/assets/imported/
