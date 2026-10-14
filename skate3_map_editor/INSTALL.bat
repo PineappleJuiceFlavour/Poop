@@ -11,6 +11,14 @@ where git >nul 2>nul || (
     echo Git is not installed. Install it from https://git-scm.com/download/win and run this again.
     pause & exit /b 1
 )
+if not exist "%ProgramFiles%\LLVM\bin\llvm-readobj.exe" (
+    echo The game's build needs LLVM. Installing it...
+    winget install -e --id LLVM.LLVM --accept-package-agreements --accept-source-agreements
+    if not exist "%ProgramFiles%\LLVM\bin\llvm-readobj.exe" (
+        echo Install LLVM from https://github.com/llvm/llvm-project/releases in its default folder, then run this again.
+        pause & exit /b 1
+    )
+)
 if not exist "%~dp0..\data" (
     echo Put the skate3_map_editor folder inside your game folder, next to skate3rust.exe and data.
     pause & exit /b 1
