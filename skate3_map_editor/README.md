@@ -56,17 +56,54 @@ after a build; the next build just takes longer.
   tiles.
 - **Your own models:** drop a `.glb`/`.gltf` file onto the game window. It's copied into the
   `imported` folder and listed under **Game files**. 3D models made for the game's mods work too.
-- **Models from your game discs:** drop a disc image (`.iso`, `.xiso`, `.gcm`) of a game you own
-  onto the window while the editor is open. It reads Xbox, Xbox 360, PS2, PSP, PC (ISO 9660) and
-  GameCube discs, searches every file, and extracts each model it can use: `.glb`/`.gltf` files,
-  `.obj` files (converted), and `.glb` models stored inside the game's archives. They go to
-  `imported\<disc name>\` and show up under **Game files**. Progress shows in the status bar.
-  Most games store their models in their own formats, so many discs give few or no models;
-  `imported\<disc name>\_disc_report.txt` lists what the disc holds.
+- **Everything from your game discs:** see [Extracting game discs](#extracting-game-discs).
 - **Collision** uses the game's own physics, the same system mod objects use, so the skater
   treats props like real level geometry. Each prop's **Collision** setting in the inspector:
   **Solid (exact)** keeps holes and doorways open, **Convex hull** wraps the whole model (cheaper,
   but fills gaps), **None** makes it decoration only.
+
+## Extracting game discs
+
+Drop any of these onto the window while the editor is open:
+- a disc image of a game you own (`.iso`, `.xiso`, `.gcm`, or a raw CD image `.bin`/`.img`/`.cue`),
+- a dumped game folder,
+- or a single game file.
+
+Disc images can come from Xbox, Xbox 360, PS1, PS2, PS3, PSP, PC or GameCube. Progress shows in
+the status bar. Then it:
+
+1. **Copies every file off the disc** to `extracted\<disc name>\`, next to `editor_maps`.
+2. **Unpacks the game's archives** into `<archive>_files\` folders beside them:
+   - Radical `.rcf` (The Simpsons: Road Rage, Hit & Run, Hulk, Scarface, Crash Tag Team Racing...)
+   - LittleBigPlanet `.farc`, with real file names from the game's `.map` database
+3. **Converts everything it has a converter for.** Models go to `imported\<disc name>\` and show up
+   under **Game files**. Images and sounds are written next to their source file.
+
+| Format | Becomes |
+|---|---|
+| Pure3D `.p3d` (Radical games): PS2 and PC/Xbox geometry, textures, sprites | One model per file (objects placed as the game places them), one per object in `<file>_parts`, PNGs in `<file>_textures` |
+| LittleBigPlanet meshes (`.mol`), with their material's texture | Models |
+| LittleBigPlanet textures (`.tex`: PS3 DXT/swizzled, Vita) | PNG |
+| `.glb`, `.gltf`, `.obj`, `.glb` hidden inside other files | Models |
+| DDS, TGA, BMP, PS1 `.tim`, PS2 `.tm2` (TIM2) | PNG |
+| Radical `.rsd`/`.rsp` sound, the audio tracks of `.rmv` movies, PS2 `.vag` | WAV |
+| PS2 `.pss` movies | `.mpg` (plays in VLC) |
+
+`extracted\<disc name>\_disc_report.txt` lists:
+- what was extracted and converted,
+- anything that couldn't be read, such as a texture format that isn't decoded yet,
+- the file types copied out as they are.
+
+LittleBigPlanet discs also get `_littlebigplanet_resources.tsv`: every resource, its type, and
+what it uses.
+
+What stays as copied:
+- **Code and system files** have nothing to convert: `.irx` PS2 drivers, `.elf`, `SYSTEM.CNF`,
+  `IOPRP*.IMG`.
+- **Game data in formats without a converter yet** stays too. That includes LittleBigPlanet
+  levels, objects, scripts and animations, which are listed in the `.tsv`.
+- **Text files** need no conversion: Hit & Run's `.mfk`, `.con`, `.cho`, `.spt` and Road Rage's
+  `.cfg`, `.tdb` and `.seq` are plain text.
 
 ## Limits
 
@@ -88,7 +125,11 @@ after a build; the next build just takes longer.
 - `crates/skate-game/src/map_pieces.rs`: copies map objects (looks, collision triangles with their
   surface codes, grind lines) and adds every placed copy, Rail and Ledge to the map's own static
   world and grind lines while playing
-- `crates/skate-map-editor/src/disc.rs`: reads disc images and extracts their models
+- `crates/skate-map-editor/src/disc.rs`: reads disc images (and raw CD images) and copies every
+  file out
+- `crates/skate-map-editor/src/convert.rs`, `radical.rs`, `lbp.rs`, `texture.rs`, `glb.rs`: the
+  archive readers and converters. The Radical and LittleBigPlanet formats follow the community's
+  open-source tools (Donut Team docs, NetP3DLib, hit-and-run-web, Craftworld Toolkit, all MIT).
 - `crates/skate-game/src/map_editor.rs`: adds the editor, loads layouts per map, renders the editor
   view through the game's own pipeline (offscreen target, retail tone mapping)
 - Small edits: `camera.rs` and the pause menu stand by while the editor is open; `app.rs`,
