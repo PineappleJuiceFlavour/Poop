@@ -941,6 +941,110 @@ index f788c1e..d559936 100644
      }
  }
  fn spawn(mut commands: Commands, config: Res<Config>, retail: Res<crate::retail_render::RetailScene>) {
+diff --git a/crates/skate-game/src/grind_world/provider.rs b/crates/skate-game/src/grind_world/provider.rs
+index 5eafeff..2082c3d 100644
+--- a/crates/skate-game/src/grind_world/provider.rs
++++ b/crates/skate-game/src/grind_world/provider.rs
+@@ -25,7 +25,8 @@ pub(crate) struct StaticProvider {
+     metadata: Vec<spline::PrimitiveMetadata>,
+     #[cfg(test)]
+     rail_guids: Vec<[u64; 2]>,
+-    assets: Vec<Asset>,
++    /// Shared so a provider extended with editor copies reuses the map's octrees.
++    assets: Vec<std::sync::Arc<Asset>>,
+     #[cfg(test)]
+     source_for_primitive: Vec<usize>,
+     #[cfg(test)]
+@@ -111,7 +112,7 @@ impl StaticProvider {
+             let bounds = indices.iter().map(|&i| spatial_bounds[i]).reduce(Bounds::union)
+                 .ok_or("Empty stock grind source section")?.padded();
+             let tree = Octree::new(bounds, indices.iter().map(|&i| spatial_bounds[i]).collect())?;
+-            Ok(Asset { #[cfg(test)] source: _source, bounds, indices, tree })
++            Ok(std::sync::Arc::new(Asset { #[cfg(test)] source: _source, bounds, indices, tree }))
+         }).collect::<Result<_, String>>()?;
+         Ok(Self { primitives, metadata, #[cfg(test)] rail_guids, assets, #[cfg(test)] source_for_primitive, #[cfg(test)] source_rail_indices })
+     }
+@@ -132,12 +133,12 @@ impl StaticProvider {
+         }).collect();
+         let assets = if let Some(bounds) = authored_bounds.iter().copied().reduce(Bounds::union) {
+             let bounds = bounds.padded();
+-            vec![Asset {
++            vec![std::sync::Arc::new(Asset {
+                 #[cfg(test)]
+                 source: SourceIdentity { stream_file: String::new(), asset_id: "host-authored".into(), section_index: 0, section_offset: 0 },
+                 bounds, indices: (0..primitives.len()).collect(),
+                 tree: Octree::new(bounds, authored_bounds.clone())?,
+-            }]
++            })]
+         } else { vec![] };
+         #[cfg(test)]
+         let source_rail_indices = primitives.iter().map(|p| p.owner - 1).collect();
+@@ -146,6 +147,65 @@ impl StaticProvider {
+ 
+     pub fn primitives(&self) -> &[Primitive] { &self.primitives }
+ 
++    /// This provider plus host-placed splines (map editor copies of the map's
++    /// own grind lines). Each spline is its consecutive segments' endpoints and
++    /// the authored GUIDs of the spline it was copied from. The map's own
++    /// primitives keep their indices; the copies get new owners after them.
++    pub fn extended(&self, splines: &[(Vec<([f32; 3], [f32; 3])>, [u64; 2])]) -> Result<Self, String> {
++        let mut primitives = self.primitives.clone();
++        let mut metadata = self.metadata.clone();
++        #[cfg(test)]
++        let mut rail_guids = self.rail_guids.clone();
++        #[cfg(test)]
++        let mut source_for_primitive = self.source_for_primitive.clone();
++        #[cfg(test)]
++        let mut source_rail_indices = self.source_rail_indices.clone();
++        let mut owner = primitives.iter().map(|p| p.owner).max().unwrap_or(0);
++        let first = primitives.len();
++        let mut segment_bounds = Vec::new();
++        for (segments, guids) in splines {
++            if segments.is_empty() { continue; }
++            owner += 1;
++            #[cfg(test)]
++            rail_guids.push(*guids);
++            for (index, &(start, end)) in segments.iter().enumerate() {
++                if start.iter().chain(&end).any(|v| !v.is_finite()) {
++                    return Err("Non-finite copied grind segment".into());
++                }
++                // Same verticality test as decoded_from_blob.
++                let tolerance = f32::from_bits(0x3780_0000);
++                let vertical = (end[0]-start[0]).abs() <= tolerance && (end[2]-start[2]).abs() <= tolerance;
++                // Lane 3 is the cubic's constant 1, as decoded_from_blob yields it.
++                primitives.push(Primitive { start: [start[0], start[1], start[2], 1.], end: [end[0], end[1], end[2], 1.], owner });
++                metadata.push(spline::PrimitiveMetadata {
++                    spline_guids: *guids,
++                    segment_index: index as u32,
++                    flags: if vertical { 0x8000_0000 } else { 0 },
++                });
++                segment_bounds.push(Bounds {
++                    min: std::array::from_fn(|i| start[i].min(end[i])),
++                    max: std::array::from_fn(|i| start[i].max(end[i])),
++                });
++                #[cfg(test)]
++                source_for_primitive.push(self.assets.len());
++                #[cfg(test)]
++                source_rail_indices.push(owner - 1);
++            }
++        }
++        let mut assets = self.assets.clone();
++        if let Some(bounds) = segment_bounds.iter().copied().reduce(Bounds::union) {
++            let bounds = bounds.padded();
++            assets.push(std::sync::Arc::new(Asset {
++                #[cfg(test)]
++                source: SourceIdentity { stream_file: String::new(), asset_id: "map-editor".into(), section_index: 0, section_offset: 0 },
++                bounds,
++                indices: (first..primitives.len()).collect(),
++                tree: Octree::new(bounds, segment_bounds)?,
++            }));
++        }
++        Ok(Self { primitives, metadata, #[cfg(test)] rail_guids, assets, #[cfg(test)] source_for_primitive, #[cfg(test)] source_rail_indices })
++    }
++
+     pub fn metadata(&self, primitive: usize) -> Option<&spline::PrimitiveMetadata> {
+         self.metadata.get(primitive)
+     }
 diff --git a/crates/skate-game/src/main.rs b/crates/skate-game/src/main.rs
 index 54f4bd2..ad8ed28 100644
 --- a/crates/skate-game/src/main.rs
@@ -1089,10 +1193,10 @@ index 0000000..3e52f23
 +}
 diff --git a/crates/skate-game/src/map_pieces.rs b/crates/skate-game/src/map_pieces.rs
 new file mode 100644
-index 0000000..b1337e6
+index 0000000..cba6507
 --- /dev/null
 +++ b/crates/skate-game/src/map_pieces.rs
-@@ -0,0 +1,584 @@
+@@ -0,0 +1,1119 @@
 +//! Copies of the map's own objects for the map editor's eyedropper.
 +//!
 +//! The world is a few big merged meshes (one per material slab and render
@@ -1100,6 +1204,11 @@ index 0000000..b1337e6
 +//! the one clicked, plus small loose parts in the same spot (a bench's slats
 +//! and legs). The copy keeps the world material, so it looks the same, and is
 +//! saved to `editor_maps/pieces` so layouts can place it after a restart.
++//!
++//! A copy also takes the original's physics: its static collision triangles
++//! (with their surface codes, which tell rails, ledges and ground apart) and
++//! its grind lines. While playing, every placed copy is added to the map's own
++//! static world and grind lines, so it rides and grinds like the original.
 +use crate::retail_render::WorldMaterial;
 +use crate::skate_world::ATTRIBUTE_MATERIAL_INDEX;
 +use bevy::asset::RenderAssetUsages;
@@ -1111,8 +1220,12 @@ index 0000000..b1337e6
 +use skate_map_editor::{
 +    EditorAction, LibraryEntry, LibraryGroup, PrefabRegistry, PropData, PropSource, UnresolvedPick, maps_dir,
 +};
-+use std::collections::{HashMap, HashSet, VecDeque};
++use skate_core::math::Vector3;
++use skate_core::physics::board_world::{BoardWorld, WorldTriangle, query_metadata};
++use skate_map_editor::{CollisionKind, EditorMode, Ghost, Primitive, Prop};
++use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 +use std::path::PathBuf;
++use std::sync::Arc;
 +
 +/// An object bigger than this is part of the ground, a wall or a building.
 +const MAX_TRIANGLES: usize = 60_000;
@@ -1123,8 +1236,9 @@ index 0000000..b1337e6
 +const WELD: f32 = 1000.0;
 +
 +pub(crate) fn install(app: &mut App) {
-+    app.add_systems(Startup, load_saved)
-+        .add_systems(Update, (copy_picked, dress_surfaces));
++    app.init_resource::<PieceLibrary>()
++        .add_systems(Startup, load_saved)
++        .add_systems(Update, (copy_picked, dress_surfaces, apply_to_map_physics));
 +}
 +
 +fn pieces_dir() -> PathBuf {
@@ -1138,7 +1252,55 @@ index 0000000..b1337e6
 +    /// The map it was copied from: its materials only exist while that map is loaded.
 +    map: String,
 +    parts: Vec<PiecePart>,
++    /// The original's static collision, around the piece's origin.
++    #[serde(default)]
++    collision: Vec<PieceCollision>,
++    /// The original's grind lines, around the piece's origin.
++    #[serde(default)]
++    grinds: Vec<PieceGrind>,
 +}
++
++/// Static collision triangles from one of the map's collision meshes.
++#[derive(Serialize, Deserialize, Clone)]
++struct PieceCollision {
++    rejection_flags: u32,
++    matching_group: i32,
++    geometry: u32,
++    pool: u8,
++    triangles: Vec<PieceTriangle>,
++}
++
++#[derive(Serialize, Deserialize, Clone)]
++struct PieceTriangle {
++    vertices: [[f32; 3]; 3],
++    /// The authored surface code: material, category and flags.
++    surface: u16,
++    tag: u32,
++    flags: u32,
++    cosines: [f32; 3],
++    fatness: f32,
++}
++
++/// One grind spline: its segments in order, and its authored GUIDs.
++#[derive(Serialize, Deserialize, Clone)]
++struct PieceGrind {
++    guids: [u64; 2],
++    segments: Vec<([f32; 3], [f32; 3])>,
++}
++
++/// The physics of every known piece, by prefab name.
++#[derive(Resource, Default)]
++struct PieceLibrary(HashMap<String, Arc<PiecePhysics>>);
++
++struct PiecePhysics {
++    collision: Vec<PieceCollision>,
++    grinds: Vec<PieceGrind>,
++}
++
++/// On a placed piece that brings the original's static collision: the mod-physics
++/// collider (`modding::editor_solids`) stays off it.
++#[derive(Component)]
++pub(crate) struct StaticPiece;
 +
 +/// The triangles of one world mesh (one material slab), around the piece's own origin.
 +#[derive(Serialize, Deserialize, Default)]
@@ -1199,7 +1361,12 @@ index 0000000..b1337e6
 +    surface: PieceSurface,
 +}
 +
-+fn register(piece: &PieceFile, meshes: &mut Assets<Mesh>, registry: &mut PrefabRegistry) {
++fn register(piece: &PieceFile, meshes: &mut Assets<Mesh>, registry: &mut PrefabRegistry, library: &mut PieceLibrary) {
++    let has_collision = piece.collision.iter().any(|c| !c.triangles.is_empty());
++    library.0.insert(
++        piece.name.clone(),
++        Arc::new(PiecePhysics { collision: piece.collision.clone(), grinds: piece.grinds.clone() }),
++    );
 +    let parts: Vec<RegisteredPart> = piece
 +        .parts
 +        .iter()
@@ -1212,6 +1379,9 @@ index 0000000..b1337e6
 +        })
 +        .collect();
 +    registry.register(piece.name.clone(), move |entity, _| {
++        if has_collision {
++            entity.insert(StaticPiece);
++        }
 +        entity.with_children(|children| {
 +            for part in &parts {
 +                children.spawn((Mesh3d(part.mesh.clone()), part.surface.clone(), Transform::default()));
@@ -1220,7 +1390,7 @@ index 0000000..b1337e6
 +    });
 +}
 +
-+fn load_saved(mut meshes: ResMut<Assets<Mesh>>, mut registry: ResMut<PrefabRegistry>) {
++fn load_saved(mut meshes: ResMut<Assets<Mesh>>, mut registry: ResMut<PrefabRegistry>, mut library: ResMut<PieceLibrary>) {
 +    let Ok(files) = std::fs::read_dir(pieces_dir()) else { return };
 +    for path in files.flatten().map(|f| f.path()) {
 +        if !path.to_string_lossy().ends_with(".piece.json") {
@@ -1229,7 +1399,7 @@ index 0000000..b1337e6
 +        match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|bytes| {
 +            serde_json::from_slice::<PieceFile>(&bytes).map_err(|e| e.to_string())
 +        }) {
-+            Ok(piece) => register(&piece, &mut meshes, &mut registry),
++            Ok(piece) => register(&piece, &mut meshes, &mut registry, &mut library),
 +            Err(error) => warn!("map editor: skipping {}: {error}", path.display()),
 +        }
 +    }
@@ -1275,7 +1445,9 @@ index 0000000..b1337e6
 +    world: Query<(Entity, &Name, &Mesh3d, &GlobalTransform, Option<&Aabb>), (With<MeshMaterial3d<WorldMaterial>>, Without<PieceSurface>)>,
 +    mut meshes: ResMut<Assets<Mesh>>,
 +    mut registry: ResMut<PrefabRegistry>,
++    mut library: ResMut<PieceLibrary>,
 +    map: Res<crate::map_transition::CurrentMap>,
++    physics: Res<crate::physics::GamePhysics>,
 +) {
 +    for pick in picks.read() {
 +        if !world.contains(pick.entity) {
@@ -1291,31 +1463,345 @@ index 0000000..b1337e6
 +                Source::new(entity, name.as_str(), meshes.get(&mesh.0)?, global)
 +            })
 +            .collect();
-+        let piece = match extract(&sources, pick.entity, pick.point) {
-+            Ok(parts) => parts,
++        let (parts, origin, bounds) = match extract(&sources, pick.entity, pick.point) {
++            Ok(found) => found,
 +            Err(error) => {
 +                actions.write(EditorAction::SetStatus(error));
 +                continue;
 +            }
 +        };
++        let collision = capture_collision(physics.world(), origin, bounds);
++        let grinds = capture_grinds(physics.grind_provider(), origin, bounds);
 +        let number = next_number(&map.name);
-+        let piece = PieceFile { version: 1, name: format!("{} piece {number}", map.name), map: map.name.clone(), parts: piece };
++        let piece = PieceFile {
++            version: 2,
++            name: format!("{} piece {number}", map.name),
++            map: map.name.clone(),
++            parts,
++            collision,
++            grinds,
++        };
 +        let path = pieces_dir().join(format!("{}_{number}.piece.json", crate::map_editor::layout_name(&map.name)));
 +        let saved = std::fs::create_dir_all(pieces_dir())
 +            .and_then(|_| std::fs::write(&path, serde_json::to_vec(&piece).unwrap_or_default()));
 +        if let Err(error) = saved {
 +            warn!("map editor: could not save {}: {error}", path.display());
 +        }
-+        register(&piece, &mut meshes, &mut registry);
++        register(&piece, &mut meshes, &mut registry, &mut library);
 +        let triangles: usize = piece.parts.iter().map(|p| p.indices.len() / 3).sum();
++        let grind_note = match piece.grinds.len() {
++            0 => "no grind lines".to_string(),
++            1 => "1 grind line".to_string(),
++            n => format!("{n} grind lines"),
++        };
 +        let mut data = PropData::new(PropSource::Prefab(piece.name.clone()));
 +        data.name = piece.name.clone();
 +        actions.write(EditorAction::AddPicked(LibraryEntry {
 +            group: LibraryGroup::Picked,
 +            label: piece.name.clone(),
-+            hint: format!("Copied from {} ({triangles} triangles)", map.name),
++            hint: format!("Copied from {} ({triangles} triangles, {grind_note})", map.name),
 +            data,
 +        }));
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// The original's physics
++
++fn v3(v: Vector3) -> Vec3 {
++    Vec3::new(v.x, v.y, v.z)
++}
++
++fn pool_code(pool: query_metadata::QueryPool) -> u8 {
++    match pool {
++        query_metadata::QueryPool::Ground => 0,
++        query_metadata::QueryPool::Island => 1,
++        query_metadata::QueryPool::Conditional => 2,
++    }
++}
++
++fn pool_from(code: u8) -> query_metadata::QueryPool {
++    match code {
++        1 => query_metadata::QueryPool::Island,
++        2 => query_metadata::QueryPool::Conditional,
++        _ => query_metadata::QueryPool::Ground,
++    }
++}
++
++/// The map's static collision triangles that belong to the piece: inside its bounds, and not
++/// the ground it stands on.
++fn capture_collision(world: &BoardWorld, origin: Vec3, bounds: Bounds) -> Vec<PieceCollision> {
++    let Ok(metadata) = world.query_metadata() else { return Vec::new() };
++    let triangles = world.triangles();
++    let outer = bounds.grown(0.08);
++    let floor = bounds.min.y + 0.02;
++    let identity = skate_core::physics::drive_frames::RetailAffineTransform::IDENTITY;
++    let mut out = Vec::new();
++    for mesh in &metadata.meshes {
++        // Static map meshes are in world space; anything else isn't a fixed part of the map.
++        if mesh.local_to_world != identity {
++            continue;
++        }
++        let mesh_bounds = Bounds { min: v3(mesh.local_bounds.min), max: v3(mesh.local_bounds.max) };
++        if !mesh_bounds.overlaps(&outer) {
++            continue;
++        }
++        let mut copied = Vec::new();
++        for i in mesh.triangle_range.clone() {
++            let triangle = &triangles[i];
++            let vertices = triangle.triangle.vertices.map(v3);
++            if !vertices.iter().all(|v| outer.contains(*v)) || vertices.iter().all(|v| v.y <= floor) {
++                continue;
++            }
++            copied.push(PieceTriangle {
++                vertices: vertices.map(|v| (v - origin).to_array()),
++                surface: metadata.packed_surfaces[i],
++                tag: triangle.tag,
++                flags: triangle.triangle.feature.flags,
++                cosines: triangle.triangle.feature.edge_cosines,
++                fatness: triangle.triangle.fatness,
++            });
++        }
++        if !copied.is_empty() {
++            out.push(PieceCollision {
++                rejection_flags: mesh.rejection_flags,
++                matching_group: mesh.matching_group,
++                geometry: mesh.geometry,
++                pool: pool_code(mesh.pool),
++                triangles: copied,
++            });
++        }
++    }
++    out
++}
++
++/// The map's grind lines that lie on the piece.
++fn capture_grinds(provider: &crate::grind_world::StaticProvider, origin: Vec3, bounds: Bounds) -> Vec<PieceGrind> {
++    let outer = bounds.grown(0.25);
++    let mut splines: BTreeMap<u64, PieceGrind> = BTreeMap::new();
++    for (i, primitive) in provider.primitives().iter().enumerate() {
++        let start = Vec3::new(primitive.start[0], primitive.start[1], primitive.start[2]);
++        let end = Vec3::new(primitive.end[0], primitive.end[1], primitive.end[2]);
++        if !outer.contains(start) || !outer.contains(end) {
++            continue;
++        }
++        let Some(metadata) = provider.metadata(i) else { continue };
++        splines
++            .entry(primitive.owner)
++            .or_insert_with(|| PieceGrind { guids: metadata.spline_guids, segments: Vec::new() })
++            .segments
++            .push(((start - origin).to_array(), (end - origin).to_array()));
++    }
++    splines.into_values().collect()
++}
++
++/// The editor's grindable Rail and Ledge, built like the engine's test-course rails: closed
++/// boxes with convex edges (surface code 0) and a grind line along each grindable edge.
++fn built_in_physics(primitive: Primitive) -> PiecePhysics {
++    use skate_core::physics::collision::TriangleFeature;
++    let mut triangles = Vec::new();
++    for (center, size) in primitive.boxes() {
++        let (min, max) = (center - size / 2., center + size / 2.);
++        let top = [Vec3::new(min.x, max.y, min.z), Vec3::new(max.x, max.y, min.z), Vec3::new(max.x, max.y, max.z), Vec3::new(min.x, max.y, max.z)];
++        let mut quads = vec![top];
++        for i in 0..4 {
++            let (a, b) = (top[i], top[(i + 1) % 4]);
++            quads.push([b, a, Vec3::new(a.x, min.y, a.z), Vec3::new(b.x, min.y, b.z)]);
++        }
++        quads.push([
++            Vec3::new(min.x, min.y, max.z),
++            Vec3::new(max.x, min.y, max.z),
++            Vec3::new(max.x, min.y, min.z),
++            Vec3::new(min.x, min.y, min.z),
++        ]);
++        for quad in quads {
++            for (half, indices) in [[0, 2, 1], [0, 3, 2]].into_iter().enumerate() {
++                let convex = if half == 0 { 0x60 } else { 0xc0 };
++                triangles.push(PieceTriangle {
++                    vertices: indices.map(|i| quad[i].to_array()),
++                    surface: 0,
++                    tag: 0,
++                    flags: TriangleFeature::ONE_SIDED | convex,
++                    cosines: [1.; 3],
++                    fatness: 0.,
++                });
++            }
++        }
++    }
++    let label = primitive.label();
++    let grinds = primitive
++        .grind_lines()
++        .into_iter()
++        .enumerate()
++        .map(|(i, (a, b))| {
++            // Authored rails' GUID scheme (grind_world::spline::build_rails): a name hash and
++            // the authored type signature.
++            let mut id = 1469598103934665603u64;
++            for byte in format!("map editor {label} {i}").bytes() {
++                id = (id ^ byte as u64).wrapping_mul(1099511628211);
++            }
++            PieceGrind { guids: [id, 0x2c70_1707_0007_004a], segments: vec![(a.to_array(), b.to_array())] }
++        })
++        .collect();
++    PiecePhysics {
++        collision: vec![PieceCollision { rejection_flags: 0, matching_group: -1, geometry: 0, pool: 0, triangles }],
++        grinds,
++    }
++}
++
++/// The map's own static world and grind lines, before any copies were added.
++struct MapPhysics {
++    generation: u64,
++    triangles: Vec<WorldTriangle>,
++    metadata: Option<query_metadata::QueryMetadata>,
++    grinds: Arc<crate::grind_world::StaticProvider>,
++    applied: u64,
++}
++
++/// While playing, adds every placed piece's collision and grind lines to the map's own.
++/// Rebuilt when the placed pieces change (on leaving the editor, or when a layout loads).
++#[allow(clippy::type_complexity)]
++fn apply_to_map_physics(
++    mode: Res<State<EditorMode>>,
++    map: Res<crate::map_transition::CurrentMap>,
++    mut physics: ResMut<crate::physics::GamePhysics>,
++    mut skater: ResMut<crate::physics::SkaterRuntime>,
++    library: Res<PieceLibrary>,
++    pieces: Query<(Entity, &Prop, &GlobalTransform), Without<Ghost>>,
++    mut base: Local<Option<MapPhysics>>,
++    mut built_in: Local<HashMap<Primitive, Arc<PiecePhysics>>>,
++) {
++    if *mode.get() != EditorMode::Playing {
++        return;
++    }
++    // A new map brings new physics: that is the base from now on.
++    if base.as_ref().is_none_or(|b| b.generation != map.generation) {
++        let world = physics.world();
++        *base = Some(MapPhysics {
++            generation: map.generation,
++            triangles: world.triangles().to_vec(),
++            metadata: world.query_metadata().ok().cloned(),
++            grinds: physics.grind_provider().clone(),
++            applied: 0,
++        });
++    }
++    let base = base.as_mut().unwrap();
++
++    let mut placed: Vec<(Entity, Arc<PiecePhysics>, Affine3A)> = pieces
++        .iter()
++        .filter(|(_, prop, _)| prop.collision != CollisionKind::None)
++        .filter_map(|(entity, prop, global)| match &prop.source {
++            PropSource::Prefab(name) => Some((entity, library.0.get(name)?.clone(), global.affine())),
++            PropSource::Primitive(primitive) if !primitive.grind_lines().is_empty() => {
++                let physics = built_in.entry(*primitive).or_insert_with(|| Arc::new(built_in_physics(*primitive)));
++                Some((entity, physics.clone(), global.affine()))
++            }
++            _ => None,
++        })
++        .collect();
++    placed.sort_by_key(|(entity, ..)| *entity);
++    let fingerprint = {
++        use std::hash::{Hash, Hasher};
++        let mut hasher = std::collections::hash_map::DefaultHasher::new();
++        for (entity, piece, affine) in &placed {
++            entity.hash(&mut hasher);
++            Arc::as_ptr(piece).hash(&mut hasher);
++            for value in affine.to_cols_array() {
++                ((value * 10_000.).round() as i64).hash(&mut hasher);
++            }
++        }
++        if placed.is_empty() { 0 } else { hasher.finish() | 1 }
++    };
++    if fingerprint == base.applied {
++        return;
++    }
++    base.applied = fingerprint;
++
++    let (world, triangles) = overlay_world(base, &placed);
++    let splines: Vec<(Vec<([f32; 3], [f32; 3])>, [u64; 2])> = placed
++        .iter()
++        .flat_map(|(_, piece, affine)| {
++            piece.grinds.iter().map(move |grind| {
++                let segments = grind
++                    .segments
++                    .iter()
++                    .map(|(a, b)| {
++                        (affine.transform_point3(Vec3::from_array(*a)).to_array(), affine.transform_point3(Vec3::from_array(*b)).to_array())
++                    })
++                    .collect();
++                (segments, grind.guids)
++            })
++        })
++        .collect();
++    let grinds = match base.grinds.extended(&splines) {
++        Ok(provider) => Arc::new(provider),
++        Err(error) => {
++            warn!("map editor: copied grind lines left out: {error}");
++            base.grinds.clone()
++        }
++    };
++    if let Some(world) = world {
++        physics.replace_static_world(world);
++    }
++    physics.replace_grind_provider(grinds.clone());
++    skater.trajectory.bind_grind_world(grinds);
++    info!(
++        "MAP_EDITOR_PHYSICS copies={} collision_triangles={triangles} grind_lines={}",
++        placed.len(),
++        splines.len()
++    );
++}
++
++/// The map's static world plus the placed pieces' collision. `None` when the map has no
++/// query metadata to extend (then copies keep their mod-physics colliders only).
++fn overlay_world(base: &MapPhysics, placed: &[(Entity, Arc<PiecePhysics>, Affine3A)]) -> (Option<BoardWorld>, usize) {
++    let (Some(metadata), Some(first)) = (&base.metadata, base.triangles.first()) else { return (None, 0) };
++    let material = first.material;
++    let mut triangles = base.triangles.clone();
++    let mut metadata = metadata.clone();
++    let identity = skate_core::physics::drive_frames::RetailAffineTransform::IDENTITY;
++    for (_, piece, affine) in placed {
++        for collision in &piece.collision {
++            let start = triangles.len();
++            for t in &collision.triangles {
++                let vertices = t.vertices.map(|v| {
++                    let p = affine.transform_point3(Vec3::from_array(v));
++                    Vector3::new(p.x, p.y, p.z)
++                });
++                if let Some(triangle) = WorldTriangle::from_vertices(vertices, material, t.tag, t.flags, t.cosines, t.fatness) {
++                    triangles.push(triangle);
++                    metadata.packed_surfaces.push(t.surface);
++                }
++            }
++            if triangles.len() == start {
++                continue;
++            }
++            let Some(local_bounds) =
++                query_metadata::Bounds::from_points(triangles[start..].iter().flat_map(|t| t.triangle.vertices))
++            else {
++                triangles.truncate(start);
++                metadata.packed_surfaces.truncate(start);
++                continue;
++            };
++            metadata.meshes.push(query_metadata::QueryMesh {
++                triangle_range: start..triangles.len(),
++                local_to_world: identity,
++                world_to_local: identity,
++                local_bounds,
++                matching_group: collision.matching_group,
++                rejection_flags: collision.rejection_flags,
++                geometry: collision.geometry,
++                pool: pool_from(collision.pool),
++            });
++        }
++    }
++    let added = triangles.len() - base.triangles.len();
++    match BoardWorld::with_query_metadata(triangles, metadata) {
++        Ok(world) => (Some(world), added),
++        Err(error) => {
++            warn!("map editor: copied collision left out: {error}");
++            (None, 0)
++        }
 +    }
 +}
 +
@@ -1376,7 +1862,8 @@ index 0000000..b1337e6
 +type Id = (u32, u32);
 +
 +/// Cuts the object around `point` (on `hit`) out of the world meshes.
-+fn extract(sources: &[Source], hit: Entity, point: Vec3) -> Result<Vec<PiecePart>, String> {
++/// The piece's meshes, its origin, and its bounds in the world.
++fn extract(sources: &[Source], hit: Entity, point: Vec3) -> Result<(Vec<PiecePart>, Vec3, Bounds), String> {
 +    let too_big = "That's part of something big (the ground, a wall or a building). Pick a smaller object: \
 +                   a bench, rail, ledge, ramp, bin or sign"
 +        .to_string();
@@ -1474,7 +1961,7 @@ index 0000000..b1337e6
 +        })
 +        .collect();
 +    parts.sort_by(|a, b| a.material.cmp(&b.material));
-+    Ok(parts)
++    Ok((parts, origin, bounds))
 +}
 +
 +/// The listed triangles of one world mesh as a mesh of their own.
@@ -1575,6 +2062,9 @@ index 0000000..b1337e6
 +    fn contains_bounds(&self, other: &Self) -> bool {
 +        self.contains(other.min) && self.contains(other.max)
 +    }
++    fn overlaps(&self, other: &Self) -> bool {
++        self.min.cmple(other.max).all() && other.min.cmple(self.max).all()
++    }
 +}
 +
 +/// Closest point to `p` on triangle `[a, b, c]` (Ericson, Real-Time Collision Detection 5.1.5).
@@ -1656,7 +2146,8 @@ index 0000000..b1337e6
 +        ];
 +
 +        // Click the seat.
-+        let parts = extract(&sources, p, Vec3::new(0.2, 0.55, 0.)).unwrap();
++        let (parts, origin, _) = extract(&sources, p, Vec3::new(0.2, 0.55, 0.)).unwrap();
++        assert!(origin.distance(Vec3::new(0., 0., 0.)) < 1e-4, "origin under the bench ({origin})");
 +        assert_eq!(parts.len(), 1, "only the props mesh");
 +        let part = &parts[0];
 +        assert_eq!(part.indices.len() / 3, 36, "seat and both legs, no bin");
@@ -1673,16 +2164,164 @@ index 0000000..b1337e6
 +        let (mesh, plain) = part.meshes();
 +        assert!(mesh.attribute(ATTRIBUTE_MATERIAL_INDEX).is_some());
 +        assert!(plain.attribute(ATTRIBUTE_MATERIAL_INDEX).is_none());
-+        let json = serde_json::to_vec(&PieceFile { version: 1, name: "t".into(), map: "m".into(), parts }).unwrap();
++        let json = serde_json::to_vec(&PieceFile {
++            version: 2,
++            name: "t".into(),
++            map: "m".into(),
++            parts,
++            collision: Vec::new(),
++            grinds: Vec::new(),
++        })
++        .unwrap();
 +        assert_eq!(serde_json::from_slice::<PieceFile>(&json).unwrap().parts[0].indices.len(), 108);
++        // Pieces saved before collision and grinds were copied still load.
++        let old = r#"{"version":1,"name":"t","map":"m","parts":[]}"#;
++        assert!(serde_json::from_str::<PieceFile>(old).unwrap().grinds.is_empty());
++    }
++
++    /// A static world like a map's: ground, plus a ledge (box top and sides) at x 0..2.
++    fn map_world() -> BoardWorld {
++        let material = skate_core::physics::contact::RetailContactMaterial { static_friction: 0., dynamic_friction: 0., restitution: 1. };
++        let tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3], surface: u32| {
++            WorldTriangle::from_vertices([a, b, c].map(|p| Vector3::new(p[0], p[1], p[2])), material, surface, 0x1e1, [-1.; 3], 0.)
++                .unwrap()
++        };
++        let triangles = vec![
++            // Ground, two big triangles at y = 0.
++            tri([-50., 0., -50.], [-50., 0., 50.], [50., 0., 50.], 1),
++            tri([-50., 0., -50.], [50., 0., 50.], [50., 0., -50.], 1),
++            // Ledge top at y = 0.5, and its front face.
++            tri([0., 0.5, 0.], [0., 0.5, 0.5], [2., 0.5, 0.5], 7),
++            tri([0., 0.5, 0.], [2., 0.5, 0.5], [2., 0.5, 0.], 7),
++            tri([0., 0., 0.5], [2., 0., 0.5], [2., 0.5, 0.5], 7),
++            tri([0., 0., 0.5], [2., 0.5, 0.5], [0., 0.5, 0.5], 7),
++        ];
++        let mesh = |range: std::ops::Range<usize>| {
++            let bounds = query_metadata::Bounds::from_points(triangles[range.clone()].iter().flat_map(|t| t.triangle.vertices)).unwrap();
++            query_metadata::QueryMesh {
++                triangle_range: range,
++                local_to_world: skate_core::physics::drive_frames::RetailAffineTransform::IDENTITY,
++                world_to_local: skate_core::physics::drive_frames::RetailAffineTransform::IDENTITY,
++                local_bounds: bounds,
++                matching_group: -1,
++                rejection_flags: 0,
++                geometry: 0,
++                pool: query_metadata::QueryPool::Ground,
++            }
++        };
++        let metadata = query_metadata::QueryMetadata {
++            packed_surfaces: vec![1, 1, 0x0207, 0x0207, 0x0207, 0x0207],
++            meshes: vec![mesh(0..2), mesh(2..6)],
++            static_edges: vec![],
++            island_flags: 0,
++        };
++        BoardWorld::with_query_metadata(triangles, metadata).unwrap()
++    }
++
++    fn down(world: &BoardWorld, x: f32, z: f32) -> Option<f32> {
++        world
++            .query_thin_line(Vector3::new(x, 5., z), Vector3::new(x, -1., z))
++            .unwrap()
++            .map(|hit| hit.geometry.position.y)
++    }
++
++    #[test]
++    fn copies_bring_the_originals_collision_and_grind_lines() {
++        let world = map_world();
++        // The ledge's grind line runs along its front top edge.
++        let rails = vec![skate_data::skate_map::Rail {
++            name: "ledge".into(),
++            closed: false,
++            points: vec![[0., 0.5, 0.5], [1., 0.5, 0.5], [2., 0.5, 0.5]],
++            native: None,
++        }];
++        let grinds = Arc::new(crate::grind_world::StaticProvider::authored(&rails).unwrap());
++
++        // Copy the ledge (render bounds 0..2 x 0..0.5 x 0..0.5, origin at its bottom centre).
++        let bounds = Bounds { min: Vec3::ZERO, max: Vec3::new(2., 0.5, 0.5) };
++        let origin = Vec3::new(1., 0., 0.25);
++        let collision = capture_collision(&world, origin, bounds);
++        let copied: usize = collision.iter().map(|c| c.triangles.len()).sum();
++        assert_eq!(copied, 4, "the ledge's four triangles, not the ground");
++        assert!(collision[0].triangles.iter().all(|t| t.surface == 0x0207 && t.tag == 7));
++        let lines = capture_grinds(&grinds, origin, bounds);
++        assert_eq!(lines.len(), 1);
++        assert_eq!(lines[0].segments.len(), 2);
++
++        // Place it 10 m away, turned 90 degrees.
++        let piece = Arc::new(PiecePhysics { collision, grinds: lines });
++        let placement = Affine3A::from_rotation_translation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2), Vec3::new(10., 0., 10.));
++        let base = MapPhysics {
++            generation: 0,
++            triangles: world.triangles().to_vec(),
++            metadata: world.query_metadata().ok().cloned(),
++            grinds: grinds.clone(),
++            applied: 0,
++        };
++        let (extended, added) = overlay_world(&base, &[(Entity::PLACEHOLDER, piece.clone(), placement)]);
++        let extended = extended.unwrap();
++        assert_eq!(added, 4);
++        // Static queries see the copy's top at its new place, and the original is still there.
++        assert!((down(&extended, 10., 10.).unwrap() - 0.5).abs() < 1e-4);
++        assert!((down(&extended, 1., 0.25).unwrap() - 0.5).abs() < 1e-4);
++        assert!(down(&extended, 20., 20.).unwrap().abs() < 1e-4, "ground elsewhere");
++        let surfaces = &extended.query_metadata().unwrap().packed_surfaces;
++        assert!(surfaces[surfaces.len() - 4..].iter().all(|&s| s == 0x0207), "surface codes kept");
++
++        // Grind lines: the copy's line is found at the new place, along the turned direction.
++        let segments: Vec<_> = piece.grinds[0]
++            .segments
++            .iter()
++            .map(|(a, b)| (placement.transform_point3(Vec3::from_array(*a)).to_array(), placement.transform_point3(Vec3::from_array(*b)).to_array()))
++            .collect();
++        let provider = grinds.extended(&[(segments, piece.grinds[0].guids)]).unwrap();
++        let near_copy = provider.query([9.5, 0., 8.5], [10.5, 1., 11.5]).unwrap();
++        assert_eq!(near_copy.len(), 2, "both copied segments");
++        for i in near_copy {
++            let p = provider.primitives()[i];
++            assert!((p.start[0] - 10.25).abs() < 1e-4 && (p.end[0] - 10.25).abs() < 1e-4, "runs along z after the turn");
++            assert!(p.owner > grinds.primitives().iter().map(|p| p.owner).max().unwrap());
++            assert_eq!(provider.metadata(i).unwrap().spline_guids, grinds.metadata(0).unwrap().spline_guids);
++        }
++        assert_eq!(provider.query([0., 0., 0.], [2., 1., 1.]).unwrap().len(), 2, "original still grindable");
++    }
++
++    #[test]
++    fn built_in_rail_is_solid_and_grindable_where_placed() {
++        let world = map_world();
++        let base = MapPhysics {
++            generation: 0,
++            triangles: world.triangles().to_vec(),
++            metadata: world.query_metadata().ok().cloned(),
++            grinds: Arc::new(crate::grind_world::StaticProvider::authored(&[]).unwrap()),
++            applied: 0,
++        };
++        let rail = Arc::new(built_in_physics(Primitive::Rail));
++        // Standing on the ground: the editor places a rail's centre 0.25 m up.
++        let placement = Affine3A::from_translation(Vec3::new(-10., 0.25, 5.));
++        let (extended, added) = overlay_world(&base, &[(Entity::PLACEHOLDER, rail.clone(), placement)]);
++        let extended = extended.unwrap();
++        assert_eq!(added, 3 * 12, "three closed boxes");
++        let top = down(&extended, -10., 5.).unwrap();
++        assert!((top - 0.5).abs() < 1e-4, "bar top at 0.5 m ({top})");
++        assert!(down(&extended, -10., 5.5).unwrap().abs() < 1e-4, "only the bar, not beside it");
++
++        let (a, b) = rail.grinds[0].segments[0];
++        let line = vec![(placement.transform_point3(Vec3::from_array(a)).to_array(), placement.transform_point3(Vec3::from_array(b)).to_array())];
++        let provider = base.grinds.extended(&[(line, rail.grinds[0].guids)]).unwrap();
++        let hits = provider.query([-12., 0., 4.5], [-8., 1., 5.5]).unwrap();
++        assert_eq!(hits.len(), 1);
++        let p = provider.primitives()[hits[0]];
++        assert_eq!([p.start[1], p.end[1]], [0.5, 0.5], "grind line on the bar top");
++        assert_eq!(built_in_physics(Primitive::Ledge).grinds.len(), 2, "ledge grinds on both top edges");
 +    }
 +}
 diff --git a/crates/skate-game/src/modding/editor_solids.rs b/crates/skate-game/src/modding/editor_solids.rs
 new file mode 100644
-index 0000000..416217d
+index 0000000..25fbd92
 --- /dev/null
 +++ b/crates/skate-game/src/modding/editor_solids.rs
-@@ -0,0 +1,382 @@
+@@ -0,0 +1,390 @@
 +//! Map editor props are solid for the skater. Each prop becomes one static body
 +//! in the mod dynamics world, which `bridge::push_dynamics_into_boardworld`
 +//! already feeds into the board's world queries (and Rapier mod objects).
@@ -1747,7 +2386,11 @@ index 0000000..416217d
 +    mut solids: ResMut<Solids>,
 +    mut mods: ResMut<Mods>,
 +    map: Res<crate::map_transition::CurrentMap>,
-+    mut props: Query<(Entity, &Prop, &GlobalTransform, Option<&mut EditorSolid>, Option<&mut Pending>), Without<Ghost>>,
++    mut props: Query<
++        (Entity, &Prop, &GlobalTransform, Option<&mut EditorSolid>, Option<&mut Pending>),
++        // Copies of map pieces carry the original's static collision instead.
++        (Without<Ghost>, Without<crate::map_pieces::StaticPiece>),
++    >,
 +    children: Query<&Children>,
 +    parts: Query<(&Mesh3d, &GlobalTransform)>,
 +    meshes: Res<Assets<Mesh>>,
@@ -1760,6 +2403,10 @@ index 0000000..416217d
 +    }
 +
 +    for (entity, prop, global, solid, pending) in &mut props {
++        // Grindable built-ins get the map's own kind of static collision (map_pieces).
++        if matches!(prop.source, PropSource::Primitive(p) if !p.grind_lines().is_empty()) {
++            continue;
++        }
 +        let (scale, rotation, translation) = global.to_scale_rotation_translation();
 +        let pose = (translation.to_array(), rotation.to_array());
 +
@@ -2085,12 +2732,38 @@ index c703abb..be797ca 100644
          app.add_systems(
              PreUpdate,
              maintenance.after(crate::map_transition::MapTransitionSet),
+diff --git a/crates/skate-game/src/physics.rs b/crates/skate-game/src/physics.rs
+index 7f5a8e7..3948e47 100644
+--- a/crates/skate-game/src/physics.rs
++++ b/crates/skate-game/src/physics.rs
+@@ -239,6 +239,21 @@ impl GamePhysics {
+         &self.world
+     }
+ 
++    /// Map editor: the static world with copies of map pieces added (built from this map's own).
++    pub(crate) fn replace_static_world(&mut self, world: BoardWorld) {
++        self.world = world;
++    }
++
++    pub(crate) fn grind_provider(&self) -> &std::sync::Arc<crate::grind_world::StaticProvider> {
++        &self.grind_world
++    }
++
++    /// Map editor: grind lines with copies of the map's own added. The skater's air trajectory
++    /// holds the provider too; rebind it with the same handle.
++    pub(crate) fn replace_grind_provider(&mut self, provider: std::sync::Arc<crate::grind_world::StaticProvider>) {
++        self.grind_world = provider;
++    }
++
+     /// Flat-world convenience used by private-asset integration tests.
+     #[cfg(test)]
+     pub fn load(asset_root: &std::path::Path) -> Result<Self, String> {
 diff --git a/crates/skate-map-editor/Cargo.toml b/crates/skate-map-editor/Cargo.toml
 new file mode 100644
-index 0000000..104ee76
+index 0000000..7b7daad
 --- /dev/null
 +++ b/crates/skate-map-editor/Cargo.toml
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,14 @@
 +[package]
 +name = "skate-map-editor"
 +description = "In-game map editor: free camera, asset browser, drag and drop placement, save/load."
@@ -2104,6 +2777,7 @@ index 0000000..104ee76
 +bevy_egui = "0.39"
 +serde.workspace = true
 +serde_json.workspace = true
++
 diff --git a/crates/skate-map-editor/examples/render_path.rs b/crates/skate-map-editor/examples/render_path.rs
 new file mode 100644
 index 0000000..fe263e7
@@ -2575,12 +3249,714 @@ index 0000000..77975cc
 +        }
 +    }
 +}
+diff --git a/crates/skate-map-editor/src/disc.rs b/crates/skate-map-editor/src/disc.rs
+new file mode 100644
+index 0000000..87354f8
+--- /dev/null
++++ b/crates/skate-map-editor/src/disc.rs
+@@ -0,0 +1,696 @@
++//! Pulls every usable 3D model out of a game disc image the player owns.
++//!
++//! Reads the disc's file system (Xbox / Xbox 360 XDVDFS, ISO 9660 for PS2, PSP
++//! and PC discs, or a GameCube disc), then looks at every file:
++//!
++//! - `.glb` / `.gltf` models are copied out (a `.gltf` with its buffers and textures),
++//! - `.obj` models are converted to `.glb`,
++//! - every other file is searched for embedded `.glb` models (uncompressed archives).
++//!
++//! Everything lands in `<assets>/imported/<disc name>/`, where the asset browser lists it, with a
++//! report of the file types the disc holds that the editor can't use (they are in the game's own
++//! formats and need a converter written for that game).
++
++use std::collections::{BTreeMap, HashSet};
++use std::fs::File;
++use std::io::{Read, Seek, SeekFrom};
++use std::path::{Path, PathBuf};
++use std::sync::{Arc, Mutex};
++
++const SECTOR: u64 = 2048;
++
++/// File extensions treated as disc images.
++pub fn is_disc_image(path: &Path) -> bool {
++    path.extension()
++        .map(|e| e.to_string_lossy().to_ascii_lowercase())
++        .is_some_and(|e| matches!(e.as_str(), "iso" | "xiso" | "gcm"))
++}
++
++/// One file on the disc.
++#[derive(Clone, Debug)]
++pub struct DiscFile {
++    /// Path inside the disc, `/` separated.
++    pub path: String,
++    /// Byte offset in the image.
++    pub offset: u64,
++    pub size: u64,
++}
++
++/// The disc's files and which file system it uses.
++pub struct Disc {
++    pub format: &'static str,
++    pub files: Vec<DiscFile>,
++}
++
++/// Lists every file on the disc image.
++pub fn read_disc(image: &mut (impl Read + Seek)) -> Result<Disc, String> {
++    let length = image.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
++    // Xbox 360 game partitions sit at a fixed offset per disc type; plain .xiso images at 0.
++    for base in [0u64, 0x0FD9_0000, 0x0208_0000, 0x1830_0000] {
++        if base + 0x10000 + 0x800 <= length && read_at(image, base + 0x10000, 20)? == b"MICROSOFT*XBOX*MEDIA" {
++            return Ok(Disc { format: "Xbox (XDVDFS)", files: xdvdfs(image, base)? });
++        }
++    }
++    if length >= 0x8006 && &read_at(image, 0x8001, 5)? == b"CD001" {
++        return Ok(Disc { format: "ISO 9660", files: iso9660(image)? });
++    }
++    if length >= 0x440 && read_at(image, 0x1C, 4)? == [0xC2, 0x33, 0x9F, 0x3D] {
++        return Ok(Disc { format: "GameCube", files: gamecube(image)? });
++    }
++    Err("not a disc image the editor can read (Xbox, Xbox 360, PS2, PSP, PC or GameCube)".into())
++}
++
++fn read_at(image: &mut (impl Read + Seek), offset: u64, len: usize) -> Result<Vec<u8>, String> {
++    let mut buf = vec![0; len];
++    image.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
++    image.read_exact(&mut buf).map_err(|e| format!("disc image is cut short: {e}"))?;
++    Ok(buf)
++}
++
++fn u16le(b: &[u8], at: usize) -> u16 {
++    u16::from_le_bytes([b[at], b[at + 1]])
++}
++fn u32le(b: &[u8], at: usize) -> u32 {
++    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
++}
++fn u32be(b: &[u8], at: usize) -> u32 {
++    u32::from_be_bytes(b[at..at + 4].try_into().unwrap())
++}
++
++/// Xbox file system: each directory is a binary tree of entries.
++fn xdvdfs(image: &mut (impl Read + Seek), base: u64) -> Result<Vec<DiscFile>, String> {
++    let volume = read_at(image, base + 0x10000, 0x800)?;
++    let (root_sector, root_size) = (u32le(&volume, 20) as u64, u32le(&volume, 24) as u64);
++    let mut files = Vec::new();
++    let mut seen = HashSet::new();
++    let mut directories = vec![(String::new(), root_sector, root_size)];
++    while let Some((prefix, sector, size)) = directories.pop() {
++        if size == 0 || size > 64 << 20 || !seen.insert(sector) {
++            continue;
++        }
++        let table = read_at(image, base + sector * SECTOR, size as usize)?;
++        let mut stack = vec![0usize];
++        let mut visited = HashSet::new();
++        while let Some(at) = stack.pop() {
++            if at + 14 > table.len() || !visited.insert(at) {
++                continue;
++            }
++            let (left, right) = (u16le(&table, at), u16le(&table, at + 2));
++            if left == 0xFFFF && right == 0xFFFF {
++                continue;
++            }
++            let (start, length, attributes, name_len) =
++                (u32le(&table, at + 4) as u64, u32le(&table, at + 8) as u64, table[at + 12], table[at + 13] as usize);
++            if at + 14 + name_len > table.len() {
++                continue;
++            }
++            let name = String::from_utf8_lossy(&table[at + 14..at + 14 + name_len]).into_owned();
++            let path = format!("{prefix}{name}");
++            if attributes & 0x10 != 0 {
++                directories.push((format!("{path}/"), start, length));
++            } else {
++                files.push(DiscFile { path, offset: base + start * SECTOR, size: length });
++            }
++            for child in [left, right] {
++                if child != 0 && child != 0xFFFF {
++                    stack.push(child as usize * 4);
++                }
++            }
++        }
++    }
++    Ok(files)
++}
++
++/// ISO 9660: directory records in extents, from the primary volume descriptor's root.
++fn iso9660(image: &mut (impl Read + Seek)) -> Result<Vec<DiscFile>, String> {
++    let descriptor = read_at(image, 0x8000, 0x800)?;
++    let root = &descriptor[156..190];
++    let mut files = Vec::new();
++    let mut seen = HashSet::new();
++    let mut directories = vec![(String::new(), u32le(root, 2) as u64, u32le(root, 10) as u64)];
++    while let Some((prefix, extent, size)) = directories.pop() {
++        if size == 0 || size > 64 << 20 || !seen.insert(extent) {
++            continue;
++        }
++        let table = read_at(image, extent * SECTOR, size as usize)?;
++        let mut at = 0;
++        while at < table.len() {
++            let len = table[at] as usize;
++            if len == 0 {
++                // Records never cross a sector boundary: the rest of this sector is padding.
++                at = (at / SECTOR as usize + 1) * SECTOR as usize;
++                continue;
++            }
++            if at + len > table.len() || len < 34 {
++                break;
++            }
++            let record = &table[at..at + len];
++            let name_len = record[32] as usize;
++            let name_bytes = &record[33..(33 + name_len).min(len)];
++            at += len;
++            if name_bytes == [0] || name_bytes == [1] {
++                continue;
++            }
++            let name = String::from_utf8_lossy(name_bytes);
++            let name = name.split(';').next().unwrap_or_default().trim_end_matches('.').to_string();
++            let (start, length) = (u32le(record, 2) as u64, u32le(record, 10) as u64);
++            if record[25] & 0x02 != 0 {
++                directories.push((format!("{prefix}{name}/"), start, length));
++            } else {
++                files.push(DiscFile { path: format!("{prefix}{name}"), offset: start * SECTOR, size: length });
++            }
++        }
++    }
++    Ok(files)
++}
++
++/// GameCube: a flat file system table of 12-byte entries plus a name table.
++fn gamecube(image: &mut (impl Read + Seek)) -> Result<Vec<DiscFile>, String> {
++    let header = read_at(image, 0x420, 0x10)?;
++    let (fst_offset, fst_size) = (u32be(&header, 4) as u64, u32be(&header, 8) as usize);
++    if fst_size < 12 || fst_size > 64 << 20 {
++        return Err("GameCube disc has no file table".into());
++    }
++    let fst = read_at(image, fst_offset, fst_size)?;
++    let count = u32be(&fst, 8) as usize;
++    if count == 0 || count * 12 > fst.len() {
++        return Err("GameCube file table is damaged".into());
++    }
++    let names = &fst[count * 12..];
++    let name_at = |offset: usize| -> String {
++        let end = names[offset.min(names.len())..].iter().position(|&b| b == 0).map_or(names.len(), |p| offset + p);
++        String::from_utf8_lossy(&names[offset.min(names.len())..end]).into_owned()
++    };
++    let mut files = Vec::new();
++    // (directory path, index where it ends)
++    let mut stack: Vec<(String, usize)> = vec![(String::new(), count)];
++    for i in 1..count {
++        while stack.len() > 1 && i >= stack.last().unwrap().1 {
++            stack.pop();
++        }
++        let entry = &fst[i * 12..i * 12 + 12];
++        let word = u32be(entry, 0);
++        let name = name_at((word & 0x00FF_FFFF) as usize);
++        let prefix = stack.last().unwrap().0.clone();
++        if word >> 24 != 0 {
++            stack.push((format!("{prefix}{name}/"), u32be(entry, 8) as usize));
++        } else {
++            files.push(DiscFile { path: format!("{prefix}{name}"), offset: u32be(entry, 4) as u64, size: u32be(entry, 8) as u64 });
++        }
++    }
++    Ok(files)
++}
++
++// ---------------------------------------------------------------------------------------------
++// Extraction
++
++/// What an import found.
++#[derive(Clone, Debug, Default)]
++pub struct DiscReport {
++    pub disc: String,
++    pub format: String,
++    pub files: usize,
++    /// Asset paths of the models written, relative to the assets folder.
++    pub models: Vec<String>,
++    /// Extension -> count, for the files no model came out of.
++    pub other: BTreeMap<String, usize>,
++}
++
++/// Shared between the import thread and the editor UI.
++#[derive(Default)]
++pub struct DiscProgress {
++    pub status: String,
++    pub finished: Option<Result<DiscReport, String>>,
++}
++
++/// Starts importing `image` into `<assets_root>/imported/<disc name>/` on a background thread.
++pub fn spawn_import(image: PathBuf, assets_root: PathBuf) -> Arc<Mutex<DiscProgress>> {
++    let progress = Arc::new(Mutex::new(DiscProgress { status: "Reading disc...".into(), finished: None }));
++    let shared = progress.clone();
++    std::thread::spawn(move || {
++        let result = import(&image, &assets_root, &|status| {
++            if let Ok(mut p) = shared.lock() {
++                p.status = status;
++            }
++        });
++        if let Ok(mut p) = shared.lock() {
++            p.finished = Some(result);
++        }
++    });
++    progress
++}
++
++pub fn import(image_path: &Path, assets_root: &Path, report_status: &dyn Fn(String)) -> Result<DiscReport, String> {
++    let mut image = File::open(image_path).map_err(|e| format!("can't open {}: {e}", image_path.display()))?;
++    let disc = read_disc(&mut image)?;
++    let name = safe_name(&image_path.file_stem().unwrap_or_default().to_string_lossy());
++    let folder = format!("imported/{name}");
++    let out_dir = assets_root.join(&folder);
++    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
++    let mut report = DiscReport { disc: name.clone(), format: disc.format.into(), files: disc.files.len(), ..Default::default() };
++    let total: u64 = disc.files.iter().map(|f| f.size).sum::<u64>().max(1);
++    let mut done = 0u64;
++
++    for file in &disc.files {
++        done += file.size;
++        report_status(format!(
++            "Searching {name} ({:.0}%): {}  [{} models found]",
++            done as f64 * 100.0 / total as f64,
++            file.path,
++            report.models.len()
++        ));
++        let extension = file.path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
++        let target = out_dir.join(safe_path(&file.path));
++        let asset = |path: &Path| path.strip_prefix(assets_root).unwrap_or(path).to_string_lossy().replace('\\', "/");
++        let found = match extension.as_str() {
++            "glb" => {
++                let bytes = read_file(&mut image, file)?;
++                is_glb(&bytes) && write(&target, &bytes).is_ok() && {
++                    report.models.push(asset(&target));
++                    true
++                }
++            }
++            "gltf" => {
++                let bytes = read_file(&mut image, file)?;
++                write(&target, &bytes)?;
++                // Its buffers and textures sit next to it.
++                let dir = file.path.rsplit_once('/').map(|(d, _)| format!("{d}/")).unwrap_or_default();
++                for sibling in disc.files.iter().filter(|f| {
++                    f.path.starts_with(&dir)
++                        && !f.path[dir.len()..].contains('/')
++                        && f.path.rsplit_once('.').is_some_and(|(_, e)| {
++                            matches!(e.to_ascii_lowercase().as_str(), "bin" | "png" | "jpg" | "jpeg" | "ktx2" | "webp")
++                        })
++                }) {
++                    let bytes = read_file(&mut image, sibling)?;
++                    let _ = write(&out_dir.join(safe_path(&sibling.path)), &bytes);
++                }
++                report.models.push(asset(&target));
++                true
++            }
++            "obj" => {
++                let bytes = read_file(&mut image, file)?;
++                match obj_to_glb(&String::from_utf8_lossy(&bytes)) {
++                    Some(glb) => {
++                        let target = target.with_extension("glb");
++                        write(&target, &glb)?;
++                        report.models.push(asset(&target));
++                        true
++                    }
++                    None => false,
++                }
++            }
++            _ => {
++                // Archives the game didn't compress can hold whole models.
++                let embedded = find_embedded_glbs(&mut image, file)?;
++                for (i, glb) in embedded.iter().enumerate() {
++                    let target = out_dir.join(format!("{}.{i}.glb", safe_path(&file.path).to_string_lossy()));
++                    write(&target, glb)?;
++                    report.models.push(asset(&target));
++                }
++                !embedded.is_empty()
++            }
++        };
++        if !found {
++            *report.other.entry(if extension.is_empty() { "(none)".into() } else { extension }).or_default() += 1;
++        }
++    }
++
++    let mut text = format!(
++        "{} ({}): {} files, {} models extracted.\n\nFiles in formats the editor can't use (the game's own formats):\n",
++        report.disc, report.format, report.files, report.models.len()
++    );
++    let mut other: Vec<_> = report.other.iter().collect();
++    other.sort_by(|a, b| b.1.cmp(a.1));
++    for (extension, count) in other {
++        text.push_str(&format!("  .{extension}: {count}\n"));
++    }
++    let _ = std::fs::write(out_dir.join("_disc_report.txt"), text);
++    Ok(report)
++}
++
++fn read_file(image: &mut File, file: &DiscFile) -> Result<Vec<u8>, String> {
++    if file.size > 2 << 30 {
++        return Err(format!("{} is too large to read", file.path));
++    }
++    read_at(image, file.offset, file.size as usize)
++}
++
++fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
++    if let Some(dir) = path.parent() {
++        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
++    }
++    std::fs::write(path, bytes).map_err(|e| e.to_string())
++}
++
++fn safe_name(name: &str) -> String {
++    let clean: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
++    if clean.trim_matches('_').is_empty() { "disc".into() } else { clean }
++}
++
++/// A disc path as a relative path that can't escape the output folder.
++fn safe_path(path: &str) -> PathBuf {
++    path.split(['/', '\\'])
++        .filter(|part| !part.is_empty() && *part != "." && *part != "..")
++        .map(|part| part.chars().map(|c| if c.is_control() || r#":*?"<>|"#.contains(c) { '_' } else { c }).collect::<String>())
++        .collect()
++}
++
++fn is_glb(bytes: &[u8]) -> bool {
++    bytes.len() >= 20 && &bytes[0..4] == b"glTF" && u32le(bytes, 4) == 2 && &bytes[16..20] == b"JSON"
++}
++
++/// Scans a file for whole `.glb` models stored inside it.
++fn find_embedded_glbs(image: &mut File, file: &DiscFile) -> Result<Vec<Vec<u8>>, String> {
++    const CHUNK: u64 = 8 << 20;
++    let mut found = Vec::new();
++    let mut at = 0u64;
++    while at < file.size {
++        let len = CHUNK.min(file.size - at);
++        // Overlap chunks so a header split across two is still seen.
++        let read = (len + 20).min(file.size - at);
++        let chunk = read_at(image, file.offset + at, read as usize)?;
++        let mut i = 0;
++        while let Some(pos) = memfind(&chunk[i..], b"glTF") {
++            let start = i + pos;
++            i = start + 4;
++            if start as u64 >= len || start + 20 > chunk.len() || !is_glb(&chunk[start..]) {
++                continue;
++            }
++            let total = u32le(&chunk, start + 8) as u64;
++            if !(20..=(512 << 20)).contains(&total) || at + start as u64 + total > file.size {
++                continue;
++            }
++            let glb = read_at(image, file.offset + at + start as u64, total as usize)?;
++            if is_glb(&glb) {
++                found.push(glb);
++            }
++        }
++        at += len;
++    }
++    Ok(found)
++}
++
++fn memfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
++    haystack.windows(needle.len()).position(|w| w == needle)
++}
++
++/// Converts a Wavefront OBJ (positions, optional UVs and normals, any polygons) to a GLB.
++pub fn obj_to_glb(text: &str) -> Option<Vec<u8>> {
++    let (mut v, mut vt, mut vn) = (Vec::<[f32; 3]>::new(), Vec::<[f32; 2]>::new(), Vec::<[f32; 3]>::new());
++    let mut corners: Vec<[i64; 3]> = Vec::new();
++    let mut polygons: Vec<std::ops::Range<usize>> = Vec::new();
++    let number = |s: Option<&str>| s.and_then(|s| s.parse::<f32>().ok());
++    for line in text.lines() {
++        let mut parts = line.split_whitespace();
++        match parts.next() {
++            Some("v") => v.push([number(parts.next())?, number(parts.next())?, number(parts.next())?]),
++            Some("vt") => vt.push([number(parts.next())?, number(parts.next()).unwrap_or(0.)]),
++            Some("vn") => vn.push([number(parts.next())?, number(parts.next())?, number(parts.next())?]),
++            Some("f") => {
++                let start = corners.len();
++                for corner in parts {
++                    let mut ids = corner.split('/');
++                    let parse = |s: Option<&str>| s.filter(|s| !s.is_empty()).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
++                    corners.push([parse(ids.next()), parse(ids.next()), parse(ids.next())]);
++                }
++                if corners.len() - start >= 3 {
++                    polygons.push(start..corners.len());
++                } else {
++                    corners.truncate(start);
++                }
++            }
++            _ => {}
++        }
++    }
++    if v.is_empty() || polygons.is_empty() {
++        return None;
++    }
++    // OBJ indices are 1-based; negative ones count back from the end.
++    let resolve = |i: i64, len: usize| -> Option<usize> {
++        match i {
++            0 => None,
++            i if i > 0 => Some(i as usize - 1).filter(|&i| i < len),
++            i => len.checked_sub((-i) as usize),
++        }
++    };
++    let has_uv = !vt.is_empty();
++    let mut unique: std::collections::HashMap<(usize, Option<usize>, Option<usize>), u32> = Default::default();
++    let (mut positions, mut normals, mut uvs, mut indices) = (Vec::new(), Vec::new(), Vec::new(), Vec::<u32>::new());
++    let mut missing_normals = false;
++    for polygon in polygons {
++        let ids: Option<Vec<u32>> = corners[polygon]
++            .iter()
++            .map(|c| {
++                let p = resolve(c[0], v.len())?;
++                let t = resolve(c[1], vt.len());
++                let n = resolve(c[2], vn.len());
++                missing_normals |= n.is_none();
++                Some(*unique.entry((p, t, n)).or_insert_with(|| {
++                    positions.push(v[p]);
++                    normals.push(n.map_or([0.; 3], |n| vn[n]));
++                    uvs.push(t.map_or([0.; 2], |t| [vt[t][0], 1. - vt[t][1]]));
++                    positions.len() as u32 - 1
++                }))
++            })
++            .collect();
++        let ids = ids?;
++        for k in 1..ids.len() - 1 {
++            indices.extend([ids[0], ids[k], ids[k + 1]]);
++        }
++    }
++    if missing_normals {
++        // Smooth normals from the faces.
++        let mut sums = vec![[0f32; 3]; positions.len()];
++        for t in indices.chunks_exact(3) {
++            let [a, b, c] = [t[0], t[1], t[2]].map(|i| positions[i as usize]);
++            let (e1, e2) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
++            let n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
++            for &i in t {
++                for k in 0..3 {
++                    sums[i as usize][k] += n[k];
++                }
++            }
++        }
++        for (normal, sum) in normals.iter_mut().zip(sums) {
++            let len = (sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]).sqrt();
++            if *normal == [0.; 3] {
++                *normal = if len > 0. { sum.map(|s| s / len) } else { [0., 1., 0.] };
++            }
++        }
++    }
++    Some(write_glb(&positions, &normals, has_uv.then_some(uvs.as_slice()), &indices))
++}
++
++/// A single-mesh GLB.
++fn write_glb(positions: &[[f32; 3]], normals: &[[f32; 3]], uvs: Option<&[[f32; 2]]>, indices: &[u32]) -> Vec<u8> {
++    let mut bin = Vec::new();
++    let mut views = Vec::new();
++    let mut push = |bytes: Vec<u8>, target: u32| {
++        while bin.len() % 4 != 0 {
++            bin.push(0);
++        }
++        views.push(format!(r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":{target}}}"#, bin.len(), bytes.len()));
++        bin.extend(bytes);
++    };
++    let floats = |values: &mut dyn Iterator<Item = f32>| values.flat_map(f32::to_le_bytes).collect::<Vec<u8>>();
++    push(floats(&mut positions.iter().flatten().copied()), 34962);
++    push(floats(&mut normals.iter().flatten().copied()), 34962);
++    if let Some(uvs) = uvs {
++        push(floats(&mut uvs.iter().flatten().copied()), 34962);
++    }
++    push(indices.iter().flat_map(|i| i.to_le_bytes()).collect(), 34963);
++    let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
++    for p in positions {
++        for k in 0..3 {
++            min[k] = min[k].min(p[k]);
++            max[k] = max[k].max(p[k]);
++        }
++    }
++    let count = positions.len();
++    let mut accessors = vec![
++        format!(r#"{{"bufferView":0,"componentType":5126,"count":{count},"type":"VEC3","min":{min:?},"max":{max:?}}}"#),
++        format!(r#"{{"bufferView":1,"componentType":5126,"count":{count},"type":"VEC3"}}"#),
++    ];
++    let mut attributes = r#""POSITION":0,"NORMAL":1"#.to_string();
++    if uvs.is_some() {
++        accessors.push(format!(r#"{{"bufferView":2,"componentType":5126,"count":{count},"type":"VEC2"}}"#));
++        attributes.push_str(r#","TEXCOORD_0":2"#);
++    }
++    let index_view = views.len() - 1;
++    let index_accessor = accessors.len();
++    accessors.push(format!(r#"{{"bufferView":{index_view},"componentType":5125,"count":{},"type":"SCALAR"}}"#, indices.len()));
++    let json = format!(
++        r#"{{"asset":{{"version":"2.0","generator":"map editor disc import"}},"scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],"meshes":[{{"primitives":[{{"attributes":{{{attributes}}},"indices":{index_accessor},"material":0}}]}}],"materials":[{{"pbrMetallicRoughness":{{"baseColorFactor":[0.8,0.8,0.8,1],"metallicFactor":0,"roughnessFactor":0.8}}}}],"buffers":[{{"byteLength":{}}}],"bufferViews":[{}],"accessors":[{}]}}"#,
++        bin.len(),
++        views.join(","),
++        accessors.join(",")
++    );
++    let mut json = json.into_bytes();
++    while json.len() % 4 != 0 {
++        json.push(b' ');
++    }
++    while bin.len() % 4 != 0 {
++        bin.push(0);
++    }
++    let total = 12 + 8 + json.len() + 8 + bin.len();
++    let mut out = Vec::with_capacity(total);
++    out.extend(b"glTF");
++    out.extend(2u32.to_le_bytes());
++    out.extend((total as u32).to_le_bytes());
++    out.extend((json.len() as u32).to_le_bytes());
++    out.extend(b"JSON");
++    out.extend(json);
++    out.extend((bin.len() as u32).to_le_bytes());
++    out.extend(b"BIN\0");
++    out.extend(bin);
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::io::Cursor;
++
++    const OBJ: &str = "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\nf 1/1 2/2 3/3 4/4\n";
++
++    fn glb() -> Vec<u8> {
++        obj_to_glb(OBJ).unwrap()
++    }
++
++    /// A tiny Xbox disc: root holds `models/` (with `crate.glb`) and an archive with a model inside.
++    fn xdvdfs_image(base: usize) -> Vec<u8> {
++        let model = glb();
++        let mut archive = b"HEADERJUNK".to_vec();
++        archive.extend(&model);
++        archive.extend(b"TRAILER");
++        let mut image = vec![0u8; base + 0x20000];
++        let sector = |s: usize| base + s * 2048;
++        image[sector(32)..sector(32) + 20].copy_from_slice(b"MICROSOFT*XBOX*MEDIA");
++        // Entry: left, right, sector, size, attributes, name length, name (padded to 4).
++        let entry = |left: u16, right: u16, start: u32, size: u32, attr: u8, name: &str| {
++            let mut e = Vec::new();
++            e.extend(left.to_le_bytes());
++            e.extend(right.to_le_bytes());
++            e.extend(start.to_le_bytes());
++            e.extend(size.to_le_bytes());
++            e.push(attr);
++            e.push(name.len() as u8);
++            e.extend(name.as_bytes());
++            while e.len() % 4 != 0 {
++                e.push(0xFF);
++            }
++            e
++        };
++        let place = |image: &mut Vec<u8>, s: usize, bytes: &[u8]| {
++            let at = sector(s);
++            if image.len() < at + bytes.len() {
++                image.resize(at + bytes.len(), 0);
++            }
++            image[at..at + bytes.len()].copy_from_slice(bytes);
++        };
++        // Root (sector 40): "models" dir with "pack.bin" as its right child.
++        let second = entry(0, 0, 50, archive.len() as u32, 0x20, "pack.bin");
++        let first = entry(0, 0, 0, 0, 0x10, "models");
++        let first = entry(0, (first.len() / 4) as u16, 41, 2048, 0x10, "models");
++        let mut root = first.clone();
++        root.extend(&second);
++        place(&mut image, 40, &root);
++        // models/ (sector 41): crate.glb at sector 42.
++        place(&mut image, 41, &entry(0, 0, 42, model.len() as u32, 0x20, "crate.glb"));
++        place(&mut image, 42, &model);
++        place(&mut image, 50, &archive);
++        let volume = sector(32);
++        image[volume + 20..volume + 24].copy_from_slice(&40u32.to_le_bytes());
++        image[volume + 24..volume + 28].copy_from_slice(&(root.len() as u32).to_le_bytes());
++        image
++    }
++
++    #[test]
++    fn obj_becomes_a_valid_glb() {
++        let glb = glb();
++        assert!(is_glb(&glb));
++        assert_eq!(u32le(&glb, 8) as usize, glb.len());
++        let json_len = u32le(&glb, 12) as usize;
++        let json: serde_json::Value = serde_json::from_slice(&glb[20..20 + json_len]).unwrap();
++        assert_eq!(json["accessors"][0]["count"], 4);
++        assert_eq!(json["accessors"][3]["count"], 6, "quad split into two triangles");
++    }
++
++    #[test]
++    fn reads_xbox_discs_at_every_partition_offset() {
++        for base in [0usize, 0x0208_0000] {
++            let mut image = Cursor::new(xdvdfs_image(base));
++            let disc = read_disc(&mut image).unwrap();
++            assert_eq!(disc.format, "Xbox (XDVDFS)");
++            let mut paths: Vec<_> = disc.files.iter().map(|f| f.path.as_str()).collect();
++            paths.sort();
++            assert_eq!(paths, ["models/crate.glb", "pack.bin"]);
++        }
++    }
++
++    #[test]
++    fn imports_models_and_models_hidden_in_archives() {
++        let dir = std::env::temp_dir().join(format!("disc-import-test-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        let image = dir.join("My Game.iso");
++        std::fs::write(&image, xdvdfs_image(0)).unwrap();
++        let report = import(&image, &dir, &|_| {}).unwrap();
++        let mut models = report.models.clone();
++        models.sort();
++        assert_eq!(models, ["imported/My_Game/models/crate.glb", "imported/My_Game/pack.bin.0.glb"]);
++        for model in &models {
++            assert!(is_glb(&std::fs::read(dir.join(model)).unwrap()));
++        }
++        assert!(dir.join("imported/My_Game/_disc_report.txt").is_file());
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn paths_from_the_disc_stay_inside_the_output_folder() {
++        assert_eq!(safe_path("../../evil/../x.glb"), PathBuf::from("evil").join("x.glb"));
++        assert_eq!(safe_path("a\\b:c.glb"), PathBuf::from("a").join("b_c.glb"));
++    }
++
++    #[test]
++    fn reads_iso9660_discs() {
++        // Primary volume descriptor at sector 16; root directory at sector 20 holding
++        // ".", ".." and MODELS/ (sector 21) with BENCH.OBJ;1 at sector 22.
++        let mut image = vec![0u8; 23 * 2048];
++        let record = |extent: u32, size: u32, dir: bool, name: &[u8]| {
++            let mut r = vec![0u8; 33];
++            r[2..6].copy_from_slice(&extent.to_le_bytes());
++            r[10..14].copy_from_slice(&size.to_le_bytes());
++            r[25] = if dir { 2 } else { 0 };
++            r[32] = name.len() as u8;
++            r.extend(name);
++            if r.len() % 2 == 1 {
++                r.push(0);
++            }
++            r[0] = r.len() as u8;
++            r
++        };
++        let put = |image: &mut Vec<u8>, at: usize, bytes: &[u8]| image[at..at + bytes.len()].copy_from_slice(bytes);
++        put(&mut image, 0x8000, &[1]);
++        put(&mut image, 0x8001, b"CD001");
++        put(&mut image, 0x8000 + 156, &record(20, 2048, true, &[0])[..34]);
++        let mut root = record(20, 2048, true, &[0]);
++        root.extend(record(20, 2048, true, &[1]));
++        root.extend(record(21, 2048, true, b"MODELS"));
++        put(&mut image, 20 * 2048, &root);
++        put(&mut image, 21 * 2048, &record(22, OBJ.len() as u32, false, b"BENCH.OBJ;1"));
++        put(&mut image, 22 * 2048, OBJ.as_bytes());
++        let disc = read_disc(&mut Cursor::new(image)).unwrap();
++        assert_eq!(disc.format, "ISO 9660");
++        assert_eq!(disc.files.len(), 1);
++        assert_eq!(disc.files[0].path, "MODELS/BENCH.OBJ");
++        assert_eq!((disc.files[0].offset, disc.files[0].size), (22 * 2048, OBJ.len() as u64));
++    }
++
++    #[test]
++    fn rejects_files_that_are_not_discs() {
++        let mut junk = Cursor::new(vec![7u8; 0x20000]);
++        assert!(read_disc(&mut junk).is_err());
++    }
++}
 diff --git a/crates/skate-map-editor/src/editor.rs b/crates/skate-map-editor/src/editor.rs
 new file mode 100644
-index 0000000..705e1ce
+index 0000000..2fab010
 --- /dev/null
 +++ b/crates/skate-map-editor/src/editor.rs
-@@ -0,0 +1,1061 @@
+@@ -0,0 +1,1112 @@
 +//! Editor behaviour: placing, selecting, moving, undo, save/load.
 +
 +use std::path::{Path, PathBuf};
@@ -2723,6 +4099,7 @@ index 0000000..705e1ce
 +impl Plugin for EditorLogicPlugin {
 +    fn build(&self, app: &mut App) {
 +        app.init_resource::<EditorState>()
++            .init_resource::<DiscImports>()
 +            .add_message::<EditorAction>()
 +            .add_message::<LoadMap>()
 +            .add_message::<UnresolvedPick>()
@@ -2735,6 +4112,7 @@ index 0000000..705e1ce
 +                    forward_load_map,
 +                    apply_actions,
 +                    (placement, select_and_drag, draw_gizmos).chain().run_if(editor_open),
++                    follow_disc_imports,
 +                )
 +                    .chain(),
 +            );
@@ -2951,6 +4329,48 @@ index 0000000..705e1ce
 +}
 +
 +/// Dropping a .glb/.gltf from Explorer/Finder onto the game window imports it.
++/// Disc images being searched on background threads.
++#[derive(Resource, Default)]
++pub(crate) struct DiscImports(Vec<(String, std::sync::Arc<std::sync::Mutex<crate::disc::DiscProgress>>)>);
++
++/// Shows disc import progress, and lists the models once a disc is done.
++fn follow_disc_imports(mut imports: ResMut<DiscImports>, mut state: ResMut<EditorState>, mut library: ResMut<Library>) {
++    imports.0.retain(|(name, progress)| {
++        let Ok(mut progress) = progress.lock() else { return false };
++        match progress.finished.take() {
++            None => {
++                state.status = progress.status.clone();
++                true
++            }
++            Some(Ok(report)) => {
++                library.request_rescan();
++                let mut other: Vec<_> = report.other.iter().collect();
++                other.sort_by(|a, b| b.1.cmp(a.1));
++                let common: Vec<String> = other.iter().take(4).map(|(e, n)| format!(".{e} x{n}")).collect();
++                let folder = format!("imported/{}", report.disc);
++                state.status = if report.models.is_empty() {
++                    format!(
++                        "{name}: no usable models. Its {} files are all in the game's own formats ({}). See {folder}/_disc_report.txt",
++                        report.files,
++                        common.join(", ")
++                    )
++                } else {
++                    format!(
++                        "{name}: imported {} models, listed under Game files. The other files are the game's own formats ({}); see {folder}/_disc_report.txt",
++                        report.models.len(),
++                        common.join(", ")
++                    )
++                };
++                false
++            }
++            Some(Err(error)) => {
++                state.status = format!("{name}: {error}");
++                false
++            }
++        }
++    });
++}
++
 +fn file_drop(mut drops: MessageReader<FileDragAndDrop>, mut actions: MessageWriter<EditorAction>) {
 +    for drop in drops.read() {
 +        if let FileDragAndDrop::DroppedFile { path_buf, .. } = drop {
@@ -3279,6 +4699,7 @@ index 0000000..705e1ce
 +    mut library: ResMut<Library>,
 +    eyedropper: Eyedropper,
 +    mut unresolved: MessageWriter<UnresolvedPick>,
++    mut disc_imports: ResMut<DiscImports>,
 +) {
 +    pending.extend(actions.read().cloned());
 +    while let Some(action) = pending.pop_front() {
@@ -3563,6 +4984,12 @@ index 0000000..705e1ce
 +                state.status = "Refreshed the asset list".into();
 +            }
 +
++            EditorAction::Import(path) if crate::disc::is_disc_image(&path) => {
++                let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
++                state.status = format!("Reading {name}...");
++                disc_imports.0.push((name, crate::disc::spawn_import(path, assets_root())));
++            }
++
 +            EditorAction::Import(path) => match import_model(&path) {
 +                Ok(asset_path) => {
 +                    library.request_rescan();
@@ -3644,10 +5071,10 @@ index 0000000..705e1ce
 +}
 diff --git a/crates/skate-map-editor/src/lib.rs b/crates/skate-map-editor/src/lib.rs
 new file mode 100644
-index 0000000..05871b3
+index 0000000..696b6f5
 --- /dev/null
 +++ b/crates/skate-map-editor/src/lib.rs
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,223 @@
 +//! # bevy_map_editor
 +//!
 +//! A drop-in, in-game map editor for any Bevy 3D game.
@@ -3668,6 +5095,7 @@ index 0000000..05871b3
 +//! Saved maps load automatically the next time the game starts (see [`MapEditorPlugin::startup_map`]).
 +
 +mod camera;
++mod disc;
 +mod editor;
 +mod library;
 +mod props;
@@ -4415,10 +5843,10 @@ index 0000000..476a629
 +}
 diff --git a/crates/skate-map-editor/src/props.rs b/crates/skate-map-editor/src/props.rs
 new file mode 100644
-index 0000000..47e76a2
+index 0000000..644b85f
 --- /dev/null
 +++ b/crates/skate-map-editor/src/props.rs
-@@ -0,0 +1,448 @@
+@@ -0,0 +1,494 @@
 +//! Placeable props: what they are, how they're saved, and how they're spawned with collision.
 +
 +use std::collections::HashMap;
@@ -4442,10 +5870,14 @@ index 0000000..47e76a2
 +    Wall,
 +    Ramp,
 +    Stairs,
++    /// A grind rail: a bar on two posts, 3 m long.
++    Rail,
++    /// A grind ledge: a 3 m concrete block.
++    Ledge,
 +}
 +
 +impl Primitive {
-+    pub const ALL: [Primitive; 8] = [
++    pub const ALL: [Primitive; 10] = [
 +        Primitive::Cube,
 +        Primitive::Sphere,
 +        Primitive::Cylinder,
@@ -4454,6 +5886,8 @@ index 0000000..47e76a2
 +        Primitive::Wall,
 +        Primitive::Ramp,
 +        Primitive::Stairs,
++        Primitive::Rail,
++        Primitive::Ledge,
 +    ];
 +
 +    pub fn label(self) -> &'static str {
@@ -4466,6 +5900,8 @@ index 0000000..47e76a2
 +            Primitive::Wall => "Wall",
 +            Primitive::Ramp => "Ramp",
 +            Primitive::Stairs => "Stairs",
++            Primitive::Rail => "Rail",
++            Primitive::Ledge => "Ledge",
 +        }
 +    }
 +
@@ -4474,7 +5910,39 @@ index 0000000..47e76a2
 +            Primitive::Floor => [0.55, 0.55, 0.58, 1.0],
 +            Primitive::Wall => [0.78, 0.74, 0.68, 1.0],
 +            Primitive::Ramp | Primitive::Stairs => [0.62, 0.66, 0.72, 1.0],
++            Primitive::Rail => [0.35, 0.37, 0.4, 1.0],
++            Primitive::Ledge => [0.66, 0.64, 0.6, 1.0],
 +            _ => [0.85, 0.85, 0.85, 1.0],
++        }
++    }
++
++    /// The boxes a primitive is built from, (center, size), when it isn't a single shape.
++    /// The game turns these into collision and puts grind lines on them ([`Primitive::grind_lines`]).
++    pub fn boxes(self) -> Vec<(Vec3, Vec3)> {
++        match self {
++            Primitive::Stairs => Self::stair_steps().collect(),
++            // Bar top at y 0.25; posts down to the ground at y -0.25.
++            Primitive::Rail => vec![
++                (Vec3::new(0.0, 0.22, 0.0), Vec3::new(3.0, 0.06, 0.06)),
++                (Vec3::new(-1.2, -0.03, 0.0), Vec3::new(0.05, 0.44, 0.05)),
++                (Vec3::new(1.2, -0.03, 0.0), Vec3::new(0.05, 0.44, 0.05)),
++            ],
++            Primitive::Ledge => vec![(Vec3::ZERO, Vec3::new(3.0, 0.5, 0.6))],
++            _ => Vec::new(),
++        }
++    }
++
++    /// Where a skater can grind this primitive, as line segments in its own space.
++    pub fn grind_lines(self) -> Vec<(Vec3, Vec3)> {
++        match self {
++            // The spline runs along the top centre of the bar.
++            Primitive::Rail => vec![(Vec3::new(-1.5, 0.25, 0.0), Vec3::new(1.5, 0.25, 0.0))],
++            // Both long top edges.
++            Primitive::Ledge => vec![
++                (Vec3::new(-1.5, 0.25, 0.3), Vec3::new(1.5, 0.25, 0.3)),
++                (Vec3::new(1.5, 0.25, -0.3), Vec3::new(-1.5, 0.25, -0.3)),
++            ],
++            _ => Vec::new(),
 +        }
 +    }
 +
@@ -4710,7 +6178,8 @@ index 0000000..47e76a2
 +#[derive(Resource)]
 +pub(crate) struct PrimitiveMeshes {
 +    shapes: HashMap<Primitive, Handle<Mesh>>,
-+    steps: Vec<(Vec3, Handle<Mesh>)>,
++    /// Primitives made of several boxes (stairs, rail, ledge).
++    boxes: HashMap<Primitive, Vec<(Vec3, Handle<Mesh>)>>,
 +}
 +
 +impl FromWorld for PrimitiveMeshes {
@@ -4724,10 +6193,15 @@ index 0000000..47e76a2
 +        shapes.insert(Primitive::Floor, meshes.add(Cuboid::new(4.0, 0.1, 4.0)));
 +        shapes.insert(Primitive::Wall, meshes.add(Cuboid::new(4.0, 3.0, 0.2)));
 +        shapes.insert(Primitive::Ramp, meshes.add(ramp_mesh()));
-+        let steps = Primitive::stair_steps()
-+            .map(|(center, size)| (center, meshes.add(Cuboid::from_size(size))))
++        let boxes = Primitive::ALL
++            .into_iter()
++            .filter(|p| !p.boxes().is_empty())
++            .map(|p| {
++                let parts = p.boxes().into_iter().map(|(center, size)| (center, meshes.add(Cuboid::from_size(size)))).collect();
++                (p, parts)
++            })
 +            .collect();
-+        Self { shapes, steps }
++        Self { shapes, boxes }
 +    }
 +}
 +
@@ -4790,10 +6264,10 @@ index 0000000..47e76a2
 +                    ..default()
 +                });
 +                entity.insert(PropMaterial(material.clone()));
-+                if *primitive == Primitive::Stairs {
-+                    let steps = self.meshes.steps.clone();
++                if let Some(parts) = self.meshes.boxes.get(primitive) {
++                    let parts = parts.clone();
 +                    entity.with_children(|parent| {
-+                        for (center, mesh) in steps {
++                        for (center, mesh) in parts {
 +                            parent.spawn((
 +                                Mesh3d(mesh),
 +                                MeshMaterial3d(material.clone()),
