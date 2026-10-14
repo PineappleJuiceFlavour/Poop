@@ -34,18 +34,15 @@ if not exist "%SOURCE%\.git" (
     git clone https://github.com/SK8-ENGINE/skate-3-rust-engine "%SOURCE%" || (pause & exit /b 1)
 )
 pushd "%SOURCE%"
-if exist "crates\skate-map-editor\Cargo.toml" (
-    echo The map editor is already added. Rebuilding...
-) else (
-    git checkout -q -f -B map-editor %GAME_COMMIT% || (popd & pause & exit /b 1)
-    rem Applied to the index, so Windows line endings in the checkout don't matter.
-    git apply --cached --whitespace=nowarn "%~dp0skate3-map-editor.patch" || (
-        echo The patch did not apply. Delete the skate-3-rust-engine folder and run this again.
-        popd & pause & exit /b 1
-    )
-    git -c user.name=map-editor -c user.email=map-editor@localhost commit -q -m "Add the map editor" || (popd & pause & exit /b 1)
-    git reset -q --hard
+rem Start from the game's build 49 and add the latest editor patch (every run, so updates apply).
+git checkout -q -f -B map-editor %GAME_COMMIT% || (popd & pause & exit /b 1)
+rem Applied to the index, so Windows line endings in the checkout don't matter.
+git apply --cached --whitespace=nowarn "%~dp0skate3-map-editor.patch" || (
+    echo The patch did not apply. Delete the skate-3-rust-engine folder and run this again.
+    popd & pause & exit /b 1
 )
+git -c user.name=map-editor -c user.email=map-editor@localhost commit -q -m "Add the map editor" || (popd & pause & exit /b 1)
+git reset -q --hard
 rem MSBuild cannot write paths over 260 characters, and this folder can be deep
 rem (Downloads\...\skate-3-rust-engine\target\...), so compile in a short folder.
 rem The finished game is still copied to skate-3-rust-engine\bin for PLAY.bat.
