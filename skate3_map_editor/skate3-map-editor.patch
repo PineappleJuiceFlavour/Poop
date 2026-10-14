@@ -6072,10 +6072,10 @@ index 0000000..f480c94
 +}
 diff --git a/crates/skate-map-editor/src/lbp.rs b/crates/skate-map-editor/src/lbp.rs
 new file mode 100644
-index 0000000..beb228d
+index 0000000..bd13596
 --- /dev/null
 +++ b/crates/skate-map-editor/src/lbp.rs
-@@ -0,0 +1,1106 @@
+@@ -0,0 +1,1205 @@
 +//! LittleBigPlanet game data: `.farc` archives, `.map` file databases and the game's resources.
 +//!
 +//! Layouts follow Craftworld Toolkit (MIT, github.com/ennuo/toolkit): `cwlib` `FileArchive`,
@@ -6271,6 +6271,8 @@ index 0000000..beb228d
 +#[derive(Clone, Copy, Debug)]
 +pub struct GcmTexture {
 +    pub format: u8,
++    /// A normal map (not a colour texture).
++    pub bump: bool,
 +    pub width: u16,
 +    pub height: u16,
 +}
@@ -6421,8 +6423,10 @@ index 0000000..beb228d
 +                r.bytes(1 + 2 + 4).ok_or_else(bad)?; // mips, dimension, cubemap, remap
 +                let width = r.u16().ok_or_else(bad)?;
 +                let height = r.u16().ok_or_else(bad)?;
-+                r.bytes(2 + 2 + 8).ok_or_else(bad)?; // depth, location, flags, pitch, offset
-+                res.gcm = Some(GcmTexture { format, width, height });
++                r.bytes(2 + 1).ok_or_else(bad)?; // depth, location
++                let bump = r.u8().ok_or_else(bad)? & 1 != 0;
++                r.bytes(8).ok_or_else(bad)?; // pitch, offset
++                res.gcm = Some(GcmTexture { format, bump, width, height });
 +            }
 +            res.data = decompress(&mut r, bytes.len()).ok_or_else(bad)?;
 +        }
@@ -6613,6 +6617,59 @@ index 0000000..beb228d
 +// ---------------------------------------------------------------------------------------------
 +// Textures
 +
++/// The texture slots of a graphics material (`GMT`), in order.
++pub fn material_textures(res: &Resource) -> Option<Vec<Ref>> {
++    // Craftworld Toolkit's own branch stores materials differently.
++    if res.magic != *b"GMT" || res.branch.0 == 0x4D5A {
++        return None;
++    }
++    let (version, sub) = (res.version(), res.subversion());
++    let mut r = Reader::new(&res.data, res.compression);
++    let flags = r.int()?;
++    r.f32()?; // alpha test level
++    r.u8()?; // alpha layer
++    if version >= 0x2FA {
++        r.u8()?; // alpha mode
++    }
++    r.u8()?; // shadow cast mode
++    r.bytes(4 * 4)?; // bump level, cosine power, reflection blur, refractive index
++    if sub >= 0x13A {
++        r.bytes(4 * 4)?; // refractive fresnel
++        if sub >= 0x16B {
++            r.u8()?;
++            if sub >= 0x17C {
++                r.bytes(6)?; // fuzz lighting
++            }
++        }
++    }
++    let vita = res.branch.0 == 0x4431 && (0x3C1..=0x3E2).contains(&version);
++    let leerdammer = res.branch.0 == 0x4C44 && res.head == 0x272;
++    let mut offsets = if flags & 0x10000 != 0 { 0x18 } else { 0xC };
++    if version < 0x3C1 || !vita || res.branch.1 < 0x10 {
++        offsets = 0xA;
++    }
++    if version < 0x393 {
++        offsets = 8;
++    }
++    if version < 0x34F {
++        offsets = 4;
++    }
++    if (version < 0x2D0 && !leerdammer) || (leerdammer && res.branch.1 < 0x13) {
++        offsets = 3;
++    }
++    for _ in 0..offsets {
++        r.int()?;
++    }
++    r.array()?; // shader code
++    let slots: Vec<Option<Ref>> = (0..8).map(|_| r.reference(version)).collect::<Option<_>>()?;
++    Some(slots.into_iter().flatten().collect())
++}
++
++/// Normal maps are marked in the PS3 header, or with a `BUMP` footer on plain DDS textures.
++fn is_bump(res: &Resource) -> bool {
++    res.gcm.is_some_and(|g| g.bump) || (res.gcm.is_none() && res.data.ends_with(b"BUMP"))
++}
++
 +/// Decodes a `TEX`/`GTF` texture resource's top mip level.
 +pub fn read_texture(res: &Resource) -> Option<Rgba> {
 +    let Some(gcm) = res.gcm else {
@@ -6764,12 +6821,18 @@ index 0000000..beb228d
 +    /// The first texture a graphics material uses, as a PNG in `images` (cached).
 +    fn material_texture(&mut self, material: Ref) -> Option<Vec<u8>> {
 +        let gmat = self.resource(material)?;
-+        let texture = gmat.dependencies.iter().filter(|d| d.kind == 1).find_map(|d| d.reference())?;
++        // The material's texture slots in order; the dependency table (unordered) if they can't
++        // be read. The first colour texture is taken; normal maps are skipped.
++        let slots = material_textures(&gmat).unwrap_or_else(|| gmat.dependencies.iter().filter(|d| d.kind == 1).filter_map(|d| d.reference()).collect());
++        slots.into_iter().find_map(|texture| self.colour_texture(texture))
++    }
++
++    fn colour_texture(&mut self, texture: Ref) -> Option<Vec<u8>> {
 +        let sha1 = self.resolve(texture)?;
 +        if let Some(cached) = self.textures.get(&sha1) {
 +            return cached.map(|i| self.images[i].clone());
 +        }
-+        let png = self.resource(Ref::Sha1(sha1)).and_then(|t| read_texture(&t)).and_then(|t| t.png());
++        let png = self.resource(Ref::Sha1(sha1)).filter(|t| !is_bump(t)).and_then(|t| read_texture(&t)).and_then(|t| t.png());
 +        // Keep the cache bounded: the decoded PNGs of a whole game can run to gigabytes.
 +        if self.images.iter().map(Vec::len).sum::<usize>() > 256 << 20 {
 +            self.images.clear();
@@ -7103,14 +7166,45 @@ index 0000000..beb228d
 +        dds[80..84].copy_from_slice(&4u32.to_le_bytes());
 +        dds[84..88].copy_from_slice(b"DXT1");
 +        dds.extend([0x00, 0xF8, 0x00, 0xF8, 0, 0, 0, 0]);
-+        let mut tex = b"TEX ".to_vec();
-+        tex.extend([0, 1, 0, 1]);
-+        tex.extend((dds.len() as u16).to_be_bytes());
-+        tex.extend((dds.len() as u16).to_be_bytes());
-+        tex.extend(&dds);
++        let texture = |dds: &[u8]| {
++            let mut tex = b"TEX ".to_vec();
++            tex.extend([0, 1, 0, 1]);
++            tex.extend((dds.len() as u16).to_be_bytes());
++            tex.extend((dds.len() as u16).to_be_bytes());
++            tex.extend(dds);
++            tex
++        };
++        let tex = texture(&dds);
 +        let tex_sha1 = [7u8; 20];
++        // A normal map (DDS with the `BUMP` footer) in the material's first slot.
++        let mut bump_dds = dds[..128].to_vec();
++        bump_dds.extend([0x1F, 0x00, 0x1F, 0x00, 0, 0, 0, 0]); // blue, unlike the red texture
++        bump_dds.extend(b"BUMP");
++        let bump = texture(&bump_dds);
++        let bump_sha1 = [8u8; 20];
 +
-+        let gmat = resource(b"GMTb", 0x272, &[0; 16], &[(None, Some(tex_sha1), 1)]);
++        // Graphics material, revision 0x272: header fields, 3 shader offsets, no code, then the
++        // texture slots: normal map, colour texture, six empty.
++        let mut body = Vec::new();
++        body.extend(0u32.to_be_bytes()); // flags
++        body.extend(0f32.to_be_bytes()); // alpha test level
++        body.extend([0, 0]); // alpha layer, shadow cast mode
++        body.extend([0u8; 16]);
++        body.extend([0u8; 12]); // shader offsets
++        body.extend(0u32.to_be_bytes()); // shader code
++        for slot in [Some(bump_sha1), Some(tex_sha1), None, None, None, None, None, None] {
++            body.extend(0u32.to_be_bytes()); // reference flags
++            match slot {
++                Some(sha1) => {
++                    body.push(1);
++                    body.extend(sha1);
++                }
++                None => body.push(0),
++            }
++        }
++        // The dependency table lists the colour texture first: the slots must win.
++        let gmat = resource(b"GMTb", 0x272, &body, &[(None, Some(tex_sha1), 1), (None, Some(bump_sha1), 1)]);
++        assert_eq!(material_textures(&read_resource(&gmat).unwrap()), Some(vec![Ref::Sha1(bump_sha1), Ref::Sha1(tex_sha1)]));
 +        let gmat_sha1 = [9u8; 20];
 +        for version in [0x132u32, 0x272, 0x3F9] {
 +            let mesh = resource(b"MSHb", version, &mesh_body(version), &[(Some(1234), None, 7)]);
@@ -7126,14 +7220,14 @@ index 0000000..beb228d
 +            let archive = dir.join("data.farc");
 +            let mut farc = Vec::new();
 +            let mut table = Vec::new();
-+            for (sha1, data) in [(tex_sha1, &tex), (gmat_sha1, &gmat), ([1u8; 20], &mesh)] {
++            for (sha1, data) in [(tex_sha1, &tex), (bump_sha1, &bump), (gmat_sha1, &gmat), ([1u8; 20], &mesh)] {
 +                table.extend(sha1);
 +                table.extend((farc.len() as u32).to_be_bytes());
 +                table.extend((data.len() as u32).to_be_bytes());
 +                farc.extend(data.iter());
 +            }
 +            farc.extend(table);
-+            farc.extend(3u32.to_be_bytes());
++            farc.extend(4u32.to_be_bytes());
 +            farc.extend(b"FARC");
 +            std::fs::write(&archive, farc).unwrap();
 +            // Database: names the mesh and maps GUID 1234 to the material.
@@ -7154,13 +7248,18 @@ index 0000000..beb228d
 +            let (_, handled) = unpack(&files, &mut out);
 +            assert!(handled.contains("data.farc") && handled.contains("blurayguids.map"));
 +            assert_eq!(out.report.models, vec!["imported/lbp/gamedata/props/crate.glb".to_string()]);
-+            assert_eq!(out.report.textures, 1);
++            assert_eq!(out.report.textures, 2, "every texture becomes a PNG, normal maps too");
 +            let glb = std::fs::read(assets.join("imported/lbp/gamedata/props/crate.glb")).unwrap();
 +            let json_len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
 +            let json: serde_json::Value = serde_json::from_slice(&glb[20..20 + json_len]).unwrap();
 +            assert_eq!(json["images"].as_array().map(Vec::len), Some(1), "the material's texture is embedded");
++            // It's the colour texture, not the normal map in the first slot.
++            let view = &json["bufferViews"][json["images"][0]["bufferView"].as_u64().unwrap() as usize];
++            let bin = 20 + json_len + 8 + view["byteOffset"].as_u64().unwrap() as usize;
++            let embedded = &glb[bin..bin + view["byteLength"].as_u64().unwrap() as usize];
++            let colour_png = std::fs::read(dir.join("extracted/data.farc_files/unnamed").join(format!("{}.tex.png", hex(&tex_sha1)))).unwrap();
++            assert_eq!(embedded, colour_png.as_slice());
 +            assert!(dir.join("extracted/data.farc_files/gamedata/props/crate.mol").exists());
-+            assert!(dir.join("extracted/data.farc_files/unnamed").join(format!("{}.tex.png", hex(&tex_sha1))).exists());
 +            std::fs::remove_dir_all(&dir).unwrap();
 +        }
 +    }
@@ -8461,10 +8560,10 @@ index 0000000..644b85f
 +}
 diff --git a/crates/skate-map-editor/src/radical.rs b/crates/skate-map-editor/src/radical.rs
 new file mode 100644
-index 0000000..e8d8fd4
+index 0000000..2652696
 --- /dev/null
 +++ b/crates/skate-map-editor/src/radical.rs
-@@ -0,0 +1,1156 @@
+@@ -0,0 +1,1386 @@
 +//! Radical Entertainment games (The Simpsons: Road Rage, The Simpsons: Hit & Run, Hulk,
 +//! Scarface, Crash Tag Team Racing, ...): `.rcf` archives, Pure3D `.p3d` models and textures,
 +//! `.rsd`/`.rsp` sounds and the audio of `.rmv` movies.
@@ -8820,7 +8919,8 @@ index 0000000..e8d8fd4
 +                (0, _, _) => flush(&mut current),
 +                (2, 2, 32) => current.uvs = le_f32s(data, count * 2).chunks_exact(2).map(|c| [c[0], c[1]]).collect(),
 +                (4, 3, 32) => current.positions = le_f32s(data, count * 3).chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect(),
-+                (3, 4, 8) => current.colors = data.chunks_exact(4).take(count).map(|c| [0, 1, 2, 3].map(|k| (c[k] as f32 / 128.0).min(1.0))).collect(),
++                // Prelit colours; 128 is full brightness, the alpha byte isn't used.
++                (3, 4, 8) => current.colors = data.chunks_exact(4).take(count).map(|c| [(c[0] as f32 / 128.0).min(1.0), (c[1] as f32 / 128.0).min(1.0), (c[2] as f32 / 128.0).min(1.0), 1.0]).collect(),
 +                (3, 3, 32) => current.normals = le_f32s(data, count * 3).chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect(),
 +                (3, 3, 16) => {
 +                    current.normals = data.chunks_exact(2).take(count * 3).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32767.0).collect::<Vec<_>>().chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect()
@@ -8850,7 +8950,8 @@ index 0000000..e8d8fd4
 +            part.colors = (0..m)
 +                .map(|i| {
 +                    let argb = f.u32(colors.data, 4 + i * 4).unwrap_or(u32::MAX);
-+                    [16, 8, 0, 24].map(|s| ((argb >> s) & 255) as f32 / 255.0)
++                    let c = |s: u32| ((argb >> s) & 255) as f32 / 255.0;
++                    [c(16), c(8), c(0), 1.0]
 +                })
 +                .collect();
 +        }
@@ -9026,11 +9127,61 @@ index 0000000..e8d8fd4
 +    m?.try_into().ok()
 +}
 +
-+/// Where each mesh is drawn: from scene graphs (0x120100) and composite drawables (0x4512)
-+/// on skeletons. Meshes nothing places are drawn once where they are.
-+fn placements(root: &Chunk, f: Fields) -> HashMap<String, Vec<Matrix>> {
-+    let mut out: HashMap<String, Vec<Matrix>> = HashMap::new();
-+    fn scene(c: &Chunk, f: Fields, m: Matrix, out: &mut HashMap<String, Vec<Matrix>>) {
++/// Where each mesh is drawn, as (mesh name in lower case, transform, is world geometry).
++///
++/// Follows how the game builds its scenes (as hit-and-run-web does): a file with a composite
++/// drawable at its root (a car, a prop) draws that composite's parts on its skeleton's joints;
++/// a world file draws static entity meshes in place and instances through scene graphs (which
++/// can name meshes or composites). Meshes nothing draws (damage states, other levels of detail,
++/// shadows) are left out. A file that places nothing draws every mesh where it is.
++fn placements(root: &Chunk, f: Fields, meshes: &HashSet<String>) -> Vec<(String, Matrix, bool)> {
++    let lower = |c: &Chunk| f.string(c.data, 0).map(|(n, _)| n.to_ascii_lowercase());
++    let skeletons: HashMap<String, &Chunk> = root.walk().into_iter().filter(|c| c.id == 0x4500).filter_map(|c| Some((lower(c)?, c))).collect();
++    let mut composites: HashMap<String, Vec<(String, Matrix)>> = HashMap::new();
++    for composite in root.walk().into_iter().filter(|c| c.id == 0x4512) {
++        let Some((name, p)) = f.string(composite.data, 0) else { continue };
++        let Some((skeleton, _)) = f.string(composite.data, p) else { continue };
++        let Some(skeleton) = skeletons.get(&skeleton.to_ascii_lowercase()) else { continue };
++        let mut joints: Vec<Matrix> = Vec::new();
++        for joint in skeleton.children.iter().filter(|c| c.id == 0x4501) {
++            let Some((_, p)) = f.string(joint.data, 0) else { break };
++            let (Some(parent), Some(local)) = (f.u32(joint.data, p), matrix(f, joint.data, p + 24)) else { break };
++            let world = match joints.get(parent as usize) {
++                Some(parent) => mul(&local, parent),
++                None => local,
++            };
++            joints.push(world);
++        }
++        let parts = composite
++            .walk()
++            .into_iter()
++            .filter(|c| c.id == 0x4516)
++            .filter_map(|prop| {
++                let (drawable, p) = f.string(prop.data, 0)?;
++                let joint = f.u32(prop.data, p + 4)?;
++                Some((drawable.to_ascii_lowercase(), *joints.get(joint as usize)?))
++            })
++            .collect();
++        composites.insert(name.to_ascii_lowercase(), parts);
++    }
++    // Entities wrapping a composite are drawn by the entity's name.
++    for entity in root.walk().into_iter().filter(|c| matches!(c.id, 0x3F0_000E | 0x3F0_0010 | 0x3F0_000C)) {
++        if let (Some(name), Some(inner)) = (lower(entity), entity.walk().into_iter().find(|c| c.id == 0x4512).and_then(lower))
++            && let Some(parts) = composites.get(&inner).cloned()
++        {
++            composites.entry(name).or_insert(parts);
++        }
++    }
++
++    let mut out = Vec::new();
++    fn instances(
++        c: &Chunk,
++        f: Fields,
++        m: Matrix,
++        meshes: &HashSet<String>,
++        composites: &HashMap<String, Vec<(String, Matrix)>>,
++        out: &mut Vec<(String, Matrix, bool)>,
++    ) {
 +        let mut m = m;
 +        if c.id == 0x120103
 +            && let Some((_, p)) = f.string(c.data, 0)
@@ -9042,37 +9193,45 @@ index 0000000..e8d8fd4
 +            && let Some((_, p)) = f.string(c.data, 0)
 +            && let Some((name, _)) = f.string(c.data, p)
 +        {
-+            out.entry(name.to_ascii_lowercase()).or_default().push(m);
-+        }
-+        for child in &c.children {
-+            scene(child, f, m, out);
-+        }
-+    }
-+    for c in root.walk() {
-+        if c.id == 0x120100 {
-+            scene(c, f, IDENTITY, &mut out);
-+        }
-+    }
-+    let skeletons: HashMap<String, &Chunk> = root.walk().into_iter().filter(|c| c.id == 0x4500).filter_map(|c| Some((f.string(c.data, 0)?.0, c))).collect();
-+    for composite in root.walk().into_iter().filter(|c| c.id == 0x4512) {
-+        let Some((_, p)) = f.string(composite.data, 0) else { continue };
-+        let Some((skeleton, _)) = f.string(composite.data, p) else { continue };
-+        let Some(skeleton) = skeletons.get(&skeleton) else { continue };
-+        let mut joints: Vec<Matrix> = Vec::new();
-+        for joint in skeleton.children.iter().filter(|c| c.id == 0x4501) {
-+            let Some((_, p)) = f.string(joint.data, 0) else { break };
-+            let (Some(parent), Some(local)) = (f.u32(joint.data, p), matrix(f, joint.data, p + 24)) else { break };
-+            let world = if (parent as usize) < joints.len() && !joints.is_empty() { mul(&local, &joints[parent as usize]) } else { local };
-+            joints.push(world);
-+        }
-+        for prop in composite.walk().into_iter().filter(|c| c.id == 0x4516) {
-+            if let Some((name, p)) = f.string(prop.data, 0)
-+                && let Some(joint) = f.u32(prop.data, p + 4)
-+                && let Some(m) = joints.get(joint as usize)
-+            {
-+                out.entry(name.to_ascii_lowercase()).or_default().push(*m);
++            let name = name.to_ascii_lowercase();
++            if meshes.contains(&name) {
++                out.push((name, m, true));
++            } else if let Some(parts) = composites.get(&name) {
++                out.extend(parts.iter().filter(|(d, _)| meshes.contains(d)).map(|(d, local)| (d.clone(), mul(local, &m), true)));
 +            }
 +        }
++        for child in &c.children {
++            instances(child, f, m, meshes, composites, out);
++        }
++    }
++    let root_composites: Vec<String> = root.children.iter().filter(|c| c.id == 0x4512).filter_map(lower).collect();
++    let world = root.children.iter().any(|c| matches!(c.id, 0x3F0_0000 | 0x120100 | 0x3F0_0002 | 0x3F0_000A | 0x3F0_0009 | 0x3F0_000E | 0x300_0008));
++    if !root_composites.is_empty() && !world {
++        for name in &root_composites {
++            for (drawable, m) in composites.get(name).into_iter().flatten() {
++                if meshes.contains(drawable) {
++                    out.push((drawable.clone(), *m, false));
++                }
++            }
++        }
++    } else {
++        for c in &root.children {
++            match c.id {
++                0x3F0_0000 => out.extend(c.children.iter().filter(|m| m.id == 0x10000).filter_map(lower).map(|n| (n, IDENTITY, true))),
++                0x120100 => instances(c, f, IDENTITY, meshes, &composites, &mut out),
++                0x3F0_0002 | 0x3F0_000A | 0x3F0_0009 | 0x3F0_000E | 0x300_0008 => {
++                    for sub in c.walk().into_iter().filter(|s| s.id == 0x300_0008) {
++                        instances(sub, f, IDENTITY, meshes, &composites, &mut out);
++                    }
++                }
++                _ => {}
++            }
++        }
++    }
++    if out.is_empty() {
++        let mut all: Vec<&String> = meshes.iter().collect();
++        all.sort();
++        out = all.into_iter().map(|n| (n.clone(), IDENTITY, true)).collect();
 +    }
 +    out
 +}
@@ -9087,6 +9246,7 @@ index 0000000..e8d8fd4
 +    /// What couldn't be read, for the report: image data kinds and primitive group layouts.
 +    failed_images: std::collections::BTreeMap<String, usize>,
 +    failed_groups: std::collections::BTreeMap<String, usize>,
++    missing_shaders: std::collections::BTreeMap<String, usize>,
 +    shaders: HashMap<String, Shader>,
 +    textures: HashMap<String, PathBuf>,
 +    cache: HashMap<String, Option<Vec<u8>>>,
@@ -9148,14 +9308,21 @@ index 0000000..e8d8fd4
 +            }
 +        }
 +    }
-+    let places = placements(&root, f);
-+    let meshes: Vec<&Chunk> = all.iter().copied().filter(|c| matches!(c.id, 0x10000 | 0x10001)).collect();
-+    let mut whole = Model::default();
-+    let mut singles = Vec::new();
-+    for mesh in &meshes {
++    // Materials and images are shared by the whole file; each mesh's geometry refers to them.
++    let mut materials: Vec<Material> = Vec::new();
++    let mut images: Vec<Vec<u8>> = Vec::new();
++    let mut material_of: HashMap<String, usize> = HashMap::new();
++    let mut image_of: HashMap<String, Option<usize>> = HashMap::new();
++    let mut geometry: HashMap<String, Model> = HashMap::new();
++    let mut order: Vec<(String, String)> = Vec::new();
++    for mesh in all.iter().filter(|c| matches!(c.id, 0x10000 | 0x10001)) {
 +        let Some((name, _)) = f.string(mesh.data, 0) else { continue };
++        let key = name.to_ascii_lowercase();
++        if geometry.contains_key(&key) {
++            continue;
++        }
++        let skin = mesh.id == 0x10001;
 +        let mut model = Model::default();
-+        let mut materials: HashMap<String, usize> = HashMap::new();
 +        for pg in mesh.children.iter().filter(|c| matches!(c.id, 0x10002 | 0x10020)) {
 +            let parsed = prim_group(pg, f).filter(|(_, parts)| !parts.is_empty());
 +            let Some((shader_name, parts)) = parsed else {
@@ -9165,70 +9332,117 @@ index 0000000..e8d8fd4
 +                *library.failed_groups.entry(format!("type {primitive}, children [{}]", ids.join(" "))).or_default() += 1;
 +                continue;
 +            };
-+            let key = shader_name.to_ascii_lowercase();
-+            let material = match materials.get(&key) {
++            let shader_key = shader_name.to_ascii_lowercase();
++            let material = match material_of.get(&shader_key) {
 +                Some(&m) => m,
 +                None => {
-+                    let shader = library.shaders.get(&key).cloned().unwrap_or_default();
-+                    let texture = (!shader.texture.is_empty()).then(|| library.png(&shader.texture, &local)).flatten().map(|png| {
-+                        model.images.push(png);
-+                        model.images.len() - 1
-+                    });
-+                    model.materials.push(Material {
++                    let shader = library.shaders.get(&shader_key).cloned().unwrap_or_default();
++                    let texture = if shader.texture.is_empty() {
++                        *library.missing_shaders.entry(if library.shaders.contains_key(&shader_key) { "shader without a texture".into() } else { "shader not found".into() }).or_default() += 1;
++                        None
++                    } else {
++                        match image_of.get(&shader.texture) {
++                            Some(&index) => index,
++                            None => {
++                                let index = library.png(&shader.texture, &local).map(|png| {
++                                    images.push(png);
++                                    images.len() - 1
++                                });
++                                if index.is_none() {
++                                    *library.missing_shaders.entry("texture not found or not decoded".into()).or_default() += 1;
++                                }
++                                image_of.insert(shader.texture.clone(), index);
++                                index
++                            }
++                        }
++                    };
++                    materials.push(Material {
 +                        name: shader_name.clone(),
 +                        color: if texture.is_some() { [1.0; 4] } else { [0.8, 0.8, 0.8, 1.0] },
 +                        texture,
 +                        alpha_mask: shader.alpha && texture.is_some(),
 +                    });
-+                    materials.insert(key, model.materials.len() - 1);
-+                    model.materials.len() - 1
++                    material_of.insert(shader_key, materials.len() - 1);
++                    materials.len() - 1
 +                }
 +            };
 +            for part in parts {
 +                model.append(Model {
 +                    positions: part.positions,
 +                    normals: part.normals,
-+                    // Pure3D's V runs the other way from glTF's.
-+                    uvs: part.uvs.into_iter().map(|[u, v]| [u, 1.0 - v]).collect(),
++                    // World and car UVs already count rows from the top, as glTF does; skinned
++                    // characters' count from the bottom.
++                    uvs: part.uvs.into_iter().map(|[u, v]| if skin { [u, 1.0 - v] } else { [u, v] }).collect(),
 +                    colors: part.colors,
-+                    primitives: vec![(part.triangles, 0)],
++                    // `append` adds the model's (empty) material count: indices stay the file's.
++                    primitives: vec![(part.triangles, material)],
 +                    ..Default::default()
 +                });
-+                // `append` numbers the part's material after the model's own: use the shared one.
-+                if let Some(last) = model.primitives.last_mut() {
-+                    last.1 = material;
-+                }
 +            }
 +        }
-+        if model.is_empty() {
-+            continue;
++        if !model.is_empty() {
++            order.push((key.clone(), name));
++            geometry.insert(key, model);
 +        }
-+        let matrices = places.get(&name.to_ascii_lowercase()).cloned().unwrap_or_else(|| vec![IDENTITY]);
-+        for m in matrices.iter().take(256) {
-+            let mut placed = model.clone();
-+            for p in &mut placed.positions {
-+                *p = transform(m, *p, 1.0);
-+            }
-+            for n in &mut placed.normals {
-+                *n = transform(m, *n, 0.0);
-+            }
-+            whole.append(placed);
-+        }
-+        singles.push((name, model));
 +    }
-+    if whole.is_empty() {
++    if geometry.is_empty() {
 +        return !local.is_empty();
 +    }
++
++    let names: HashSet<String> = geometry.keys().cloned().collect();
++    let mut whole = Model::default();
++    for (name, m, world) in placements(&root, f, &names).into_iter().take(20_000) {
++        let Some(mesh) = geometry.get(&name) else { continue };
++        let mut placed = mesh.clone();
++        for p in &mut placed.positions {
++            *p = transform(&m, *p, 1.0);
++        }
++        for n in &mut placed.normals {
++            *n = transform(&m, *n, 0.0);
++        }
++        // Cars aren't prelit: their vertex colours aren't lighting.
++        if !world {
++            placed.colors.clear();
++        }
++        whole.append(placed);
++    }
 +    let stem = rel.rsplit_once('.').map_or(rel, |(s, _)| s);
-+    out.add_model(stem, &to_gltf_axes(whole).to_glb().unwrap_or_default());
-+    if singles.len() > 1 && singles.len() <= 200 {
-+        for (name, model) in singles {
-+            if let Some(glb) = to_gltf_axes(model).to_glb() {
++    if let Some(glb) = to_gltf_axes(with_materials(whole, &materials, &images)).to_glb() {
++        out.add_model(stem, &glb);
++    }
++    if order.len() > 1 && order.len() <= 200 {
++        for (key, name) in order {
++            if let Some(glb) = to_gltf_axes(with_materials(geometry.remove(&key).unwrap_or_default(), &materials, &images)).to_glb() {
 +                out.add_model(&format!("{stem}_parts/{name}"), &glb);
 +            }
 +        }
 +    }
 +    true
++}
++
++/// Gives geometry (whose primitives use the file's material numbers) the materials and images it
++/// uses, renumbered.
++fn with_materials(mut model: Model, materials: &[Material], images: &[Vec<u8>]) -> Model {
++    let mut material_map: HashMap<usize, usize> = HashMap::new();
++    let mut image_map: HashMap<usize, usize> = HashMap::new();
++    for (_, material) in &mut model.primitives {
++        let next = material_map.len();
++        let index = *material_map.entry(*material).or_insert(next);
++        if index == next {
++            let mut m = materials.get(*material).cloned().unwrap_or_default();
++            m.texture = m.texture.map(|t| {
++                let next = image_map.len();
++                let i = *image_map.entry(t).or_insert(next);
++                if i == next {
++                    model.images.push(images[t].clone());
++                }
++                i
++            });
++            model.materials.push(m);
++        }
++        *material = index;
++    }
++    model
 +}
 +
 +/// The game is left-handed: mirror Z and flip the winding.
@@ -9390,6 +9604,9 @@ index 0000000..e8d8fd4
 +    }
 +    for (kind, count) in &library.failed_images {
 +        out.add_note(format!("Pure3D images not decoded ({count}): {kind}"));
++    }
++    for (kind, count) in &library.missing_shaders {
++        out.add_note(format!("Pure3D materials without a texture ({count}): {kind}"));
 +    }
 +    for (kind, count) in library.failed_groups.iter().take(20) {
 +        out.add_note(format!("Pure3D mesh parts without readable geometry ({count}): {kind}"));
@@ -9573,6 +9790,118 @@ index 0000000..e8d8fd4
 +        let json: serde_json::Value = serde_json::from_slice(&glb[20..20 + json_len]).unwrap();
 +        assert_eq!(json["images"].as_array().map(Vec::len), Some(1));
 +        assert_eq!(json["materials"][0]["name"], "wall_m");
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++
++    fn mesh(name: &str, shader: &str) -> Vec<u8> {
++        let mut payload = string(name);
++        payload.extend([0u8; 8]);
++        chunk(0x10000, &payload, &[ps2_prim_group(shader)])
++    }
++
++    fn translation(x: f32) -> Vec<u8> {
++        let mut m = [0f32; 16];
++        m[0] = 1.0;
++        m[5] = 1.0;
++        m[10] = 1.0;
++        m[15] = 1.0;
++        m[12] = x;
++        m.iter().flat_map(|v| v.to_le_bytes()).collect()
++    }
++
++    /// A shared texture "paint" and shader "paint_m" using it.
++    fn paint() -> Vec<Vec<u8>> {
++        let png = Rgba { width: 1, height: 1, pixels: vec![255, 0, 0, 255] }.png().unwrap();
++        let mut data = (png.len() as u32).to_le_bytes().to_vec();
++        data.extend(png);
++        let mut tex = string("paint");
++        tex.extend([0u8; 36]);
++        let mut img = string("paint");
++        img.extend([0u8; 28]);
++        let mut sh = string("paint_m");
++        sh.extend(0u32.to_le_bytes());
++        sh.extend(string("simple"));
++        sh.extend([0u8; 16]);
++        let mut param = b"TEX\0".to_vec();
++        param.extend(string("paint"));
++        vec![
++            chunk(0x19000, &tex, &[chunk(0x19001, &img, &[chunk(0x19002, &data, &[])])]),
++            chunk(0x11000, &sh, &[chunk(0x11002, &param, &[])]),
++        ]
++    }
++
++    fn glb_json(glb: &[u8]) -> serde_json::Value {
++        let len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
++        serde_json::from_slice(&glb[20..20 + len]).unwrap()
++    }
++
++    fn convert_file(file: Vec<u8>) -> (Vec<String>, std::path::PathBuf) {
++        let dir = std::env::temp_dir().join(format!("p3d-place-{}-{}", std::process::id(), file.len()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        std::fs::write(dir.join("thing.p3d"), file).unwrap();
++        let mut out = Output::new(&dir.join("x"), &dir.join("assets"), "g", Box::new(|_| {}));
++        unpack(&[(dir.join("thing.p3d"), "thing.p3d".into())], &mut out);
++        (out.report.models.clone(), dir)
++    }
++
++    #[test]
++    fn places_car_parts_on_their_joints_and_leaves_out_unused_meshes() {
++        // Skeleton: root joint, and a wheel joint 2 units along X.
++        let joint = |name: &str, parent: u32, x: f32| {
++            let mut j = string(name);
++            j.extend(parent.to_le_bytes());
++            j.extend([0u8; 20]);
++            j.extend(translation(x));
++            chunk(0x4501, &j, &[])
++        };
++        let mut skeleton = string("car_skel");
++        skeleton.extend([0u8; 8]);
++        let skeleton = chunk(0x4500, &skeleton, &[joint("root", 0, 0.0), joint("wheel", 0, 2.0)]);
++        let prop = |drawable: &str, joint: u32| {
++            let mut p = string(drawable);
++            p.extend(0u32.to_le_bytes());
++            p.extend(joint.to_le_bytes());
++            chunk(0x4516, &p, &[])
++        };
++        let mut composite = string("car");
++        composite.extend(string("car_skel"));
++        let composite = chunk(0x4512, &composite, &[chunk(0x4513, &[], &[prop("body", 0), prop("wheel", 1)])]);
++        let mut file = paint();
++        file.extend([mesh("body", "paint_m"), mesh("wheel", "paint_m"), mesh("body_damaged", "paint_m"), skeleton, composite]);
++        let (models, dir) = convert_file(P3dWriter::file(&file));
++        assert_eq!(models[0], "imported/g/thing.glb");
++        let json = glb_json(&std::fs::read(dir.join("assets").join(&models[0])).unwrap());
++        // Body (4 vertices) and wheel (4), not the damaged body.
++        assert_eq!(json["accessors"][0]["count"], 8);
++        assert_eq!(json["accessors"][0]["max"][0], 3.0, "the wheel sits on its joint");
++        assert_eq!(json["images"].as_array().unwrap().len(), 1, "one copy of the shared texture");
++        // The three meshes are also exported on their own.
++        assert_eq!(models.len(), 4);
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn instances_world_objects_through_scene_graphs() {
++        let transform = |x: f32, children: &[Vec<u8>]| {
++            let mut t = string("t");
++            t.extend(1u32.to_le_bytes());
++            t.extend(translation(x));
++            chunk(0x120103, &t, children)
++        };
++        let drawable = |name: &str| {
++            let mut d = string("label");
++            d.extend(string(name));
++            chunk(0x120107, &d, &[])
++        };
++        let scene = chunk(0x120100, &string("scene"), &[transform(0.0, &[drawable("tree")]), transform(10.0, &[drawable("tree")]), transform(20.0, &[drawable("tree")])]);
++        let mut file = paint();
++        file.extend([mesh("tree", "paint_m"), scene]);
++        let (models, dir) = convert_file(P3dWriter::file(&file));
++        let json = glb_json(&std::fs::read(dir.join("assets").join(&models[0])).unwrap());
++        assert_eq!(json["accessors"][0]["count"], 12, "three trees");
++        assert_eq!(json["accessors"][0]["max"][0], 21.0);
++        assert_eq!(json["images"].as_array().unwrap().len(), 1);
 +        std::fs::remove_dir_all(&dir).unwrap();
 +    }
 +

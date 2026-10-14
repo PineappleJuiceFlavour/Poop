@@ -81,7 +81,7 @@ the status bar. Then it:
 
 | Format | Becomes |
 |---|---|
-| Pure3D `.p3d` (Radical games): PS2 and PC/Xbox geometry, textures, sprites | One model per file (objects placed as the game places them), one per object in `<file>_parts`, PNGs in `<file>_textures` |
+| Pure3D `.p3d` (Radical games): PS2 and PC/Xbox geometry, textures, sprites | One model per file with only what the game draws, placed where the game places it; every object on its own in `<file>_parts` (damage states and spare detail levels only appear there); PNGs in `<file>_textures` |
 | LittleBigPlanet meshes (`.mol`), with their material's texture | Models |
 | LittleBigPlanet textures (`.tex`: PS3 DXT/swizzled, Vita) | PNG |
 | `.glb`, `.gltf`, `.obj`, `.glb` hidden inside other files | Models |
