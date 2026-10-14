@@ -46,9 +46,15 @@ after a build; the next build just takes longer.
 
 - **Each map has its own layout.** It loads when you go to that map, and Ctrl+S saves it to
   `editor_maps\<map name>.map.json` in your game data folder.
-- **Props:** ramps, stairs, boxes, walls, floor tiles and more are built in. Any `.glb`/`.gltf` model
-  can be added: drop it onto the game window and it appears under **Game files**. 3D models made
-  for the game's mods work too.
+- **Copy the map's own objects:** click **🎯 Pick from game**, then click a bench, rail, ledge, bin,
+  sign or ramp in the map. The editor cuts that object out of the map (with its loose parts, like a
+  bench's legs) and you can place as many copies as you like. Copies look exactly like the original
+  on the map they came from, and plain grey on other maps. They're saved in
+  `editor_maps\pieces\` and listed under **Game objects** next time.
+  The ground, walls and buildings are too big to copy.
+- **Built-in props:** ramps, stairs, boxes, walls, floor tiles and more.
+- **Your own models:** drop a `.glb`/`.gltf` file onto the game window. It's copied into the
+  `imported` folder and listed under **Game files**. 3D models made for the game's mods work too.
 - **Collision** uses the game's own physics, the same system mod objects use, so the skater
   treats props like real level geometry. Each prop's **Collision** setting in the inspector:
   **Solid (exact)** keeps holes and doorways open, **Convex hull** wraps the whole model (cheaper,
@@ -58,8 +64,7 @@ after a build; the next build just takes longer.
 
 - Rails on placed props aren't grindable yet: grind rails are separate map data in this game, not
   mesh collision. You can ride, ollie onto and bail off props, but not lock into a grind on them.
-- The Skate 3 world itself is generated from `.skate` data, so the eyedropper (🎯 Pick) can't copy
-  pieces of the original map. It does copy models the game or mods load from files.
+- A copied piece's material only exists on the map it came from; on other maps it's plain grey.
 - While the editor is open the game is paused. It isn't made for online sessions: edit offline.
 
 ## What it changes in the game

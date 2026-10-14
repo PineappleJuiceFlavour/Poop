@@ -942,28 +942,33 @@ index f788c1e..d559936 100644
  }
  fn spawn(mut commands: Commands, config: Res<Config>, retail: Res<crate::retail_render::RetailScene>) {
 diff --git a/crates/skate-game/src/main.rs b/crates/skate-game/src/main.rs
-index 54f4bd2..d89b257 100644
+index 54f4bd2..ad8ed28 100644
 --- a/crates/skate-game/src/main.rs
 +++ b/crates/skate-game/src/main.rs
-@@ -60,6 +60,7 @@ mod game_audio;
+@@ -60,6 +60,8 @@ mod game_audio;
  pub(crate) mod world_audio;
  pub(crate) mod ui_audio;
  mod trigger_volumes;
 +mod map_editor;
++mod map_pieces;
  
  fn main() -> bevy::app::AppExit {
      match updater::recover() {
 diff --git a/crates/skate-game/src/map_editor.rs b/crates/skate-game/src/map_editor.rs
 new file mode 100644
-index 0000000..a72a25c
+index 0000000..3e52f23
 --- /dev/null
 +++ b/crates/skate-game/src/map_editor.rs
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,127 @@
 +//! In-game map editor (F1): fly around, drag props into the world, save.
 +//!
 +//! Each map has its own layout in `editor_maps/<map name>.map.json` beside the
 +//! data folder. It loads when the map does, and Ctrl+S saves it. Placed props
-+//! are solid for the skater (`modding::editor_solids`).
++//! are solid for the skater (`modding::editor_solids`). The eyedropper copies
++//! objects out of the map itself (`map_pieces`).
++//!
++//! The asset list shows the editor's own `imported` folder (models dropped on
++//! the window) rather than the data folder, which only holds skater models.
 +use bevy::prelude::*;
 +use skate_map_editor::{EditorAction, EditorCamera, EditorMode, MapEditorPlugin, editor_closed, maps_dir};
 +
@@ -978,8 +983,12 @@ index 0000000..a72a25c
 +        app.add_plugins(MapEditorPlugin {
 +            assets_dir: Some(asset_root),
 +            maps_dir: Some(maps),
++            file_folders: Some(vec!["imported".into()]),
++            show_loaded: false,
++            handles_unresolved_picks: true,
 +            ..default()
 +        });
++        crate::map_pieces::install(app);
 +        // The editor's UI is the only egui in the game; keep egui off the game's own cameras.
 +        app.world_mut().resource_mut::<bevy_egui::EguiGlobalSettings>().auto_create_primary_context = false;
 +        app
@@ -1058,7 +1067,7 @@ index 0000000..a72a25c
 +}
 +
 +/// A file name for a map: letters, digits, `-` and `_`.
-+fn layout_name(map: &str) -> String {
++pub(crate) fn layout_name(map: &str) -> String {
 +    let name: String = map
 +        .trim()
 +        .chars()
@@ -1076,6 +1085,596 @@ index 0000000..a72a25c
 +        assert_eq!(layout_name("University"), "university");
 +        assert_eq!(layout_name("Port Carverton / Downtown"), "port_carverton___downtown");
 +        assert_eq!(layout_name("../.."), "map");
++    }
++}
+diff --git a/crates/skate-game/src/map_pieces.rs b/crates/skate-game/src/map_pieces.rs
+new file mode 100644
+index 0000000..b1337e6
+--- /dev/null
++++ b/crates/skate-game/src/map_pieces.rs
+@@ -0,0 +1,584 @@
++//! Copies of the map's own objects for the map editor's eyedropper.
++//!
++//! The world is a few big merged meshes (one per material slab and render
++//! class), so a pick cuts one object out of them: the triangles connected to
++//! the one clicked, plus small loose parts in the same spot (a bench's slats
++//! and legs). The copy keeps the world material, so it looks the same, and is
++//! saved to `editor_maps/pieces` so layouts can place it after a restart.
++use crate::retail_render::WorldMaterial;
++use crate::skate_world::ATTRIBUTE_MATERIAL_INDEX;
++use bevy::asset::RenderAssetUsages;
++use bevy::camera::primitives::Aabb;
++use bevy::math::Affine3A;
++use bevy::mesh::{Indices, MeshVertexAttribute, PrimitiveTopology, VertexAttributeValues};
++use bevy::prelude::*;
++use serde::{Deserialize, Serialize};
++use skate_map_editor::{
++    EditorAction, LibraryEntry, LibraryGroup, PrefabRegistry, PropData, PropSource, UnresolvedPick, maps_dir,
++};
++use std::collections::{HashMap, HashSet, VecDeque};
++use std::path::PathBuf;
++
++/// An object bigger than this is part of the ground, a wall or a building.
++const MAX_TRIANGLES: usize = 60_000;
++const MAX_EXTENT: f32 = 30.0;
++/// World meshes this far from the click are not searched.
++const SEARCH_RADIUS: f32 = 40.0;
++/// Vertices closer than this (1 mm) count as shared.
++const WELD: f32 = 1000.0;
++
++pub(crate) fn install(app: &mut App) {
++    app.add_systems(Startup, load_saved)
++        .add_systems(Update, (copy_picked, dress_surfaces));
++}
++
++fn pieces_dir() -> PathBuf {
++    maps_dir().join("pieces")
++}
++
++#[derive(Serialize, Deserialize)]
++struct PieceFile {
++    version: u32,
++    name: String,
++    /// The map it was copied from: its materials only exist while that map is loaded.
++    map: String,
++    parts: Vec<PiecePart>,
++}
++
++/// The triangles of one world mesh (one material slab), around the piece's own origin.
++#[derive(Serialize, Deserialize, Default)]
++struct PiecePart {
++    /// The world mesh's name, which identifies its material: `world Opaque slab 3`.
++    material: String,
++    positions: Vec<[f32; 3]>,
++    normals: Vec<[f32; 3]>,
++    uv0: Vec<[f32; 2]>,
++    uv1: Vec<[f32; 2]>,
++    color: Vec<[f32; 4]>,
++    material_index: Vec<u32>,
++    tangents: Vec<[f32; 4]>,
++    indices: Vec<u32>,
++}
++
++impl PiecePart {
++    /// The mesh as the world draws it, and a copy for maps where its material doesn't exist.
++    fn meshes(&self) -> (Mesh, Mesh) {
++        let count = self.positions.len();
++        let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
++            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions.clone());
++        if self.normals.len() == count {
++            mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals.clone());
++        }
++        if self.uv0.len() == count {
++            mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, self.uv0.clone());
++        }
++        if self.uv1.len() == count {
++            mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, self.uv1.clone());
++        }
++        if self.tangents.len() == count {
++            mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, self.tangents.clone());
++        }
++        mesh.insert_indices(Indices::U32(self.indices.clone()));
++        let plain = mesh.clone();
++        if self.color.len() == count {
++            mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, self.color.clone());
++        }
++        if self.material_index.len() == count {
++            mesh.insert_attribute(ATTRIBUTE_MATERIAL_INDEX, self.material_index.clone());
++        }
++        (mesh, plain)
++    }
++}
++
++/// One mesh of a placed piece, waiting for (or wearing) its material.
++#[derive(Component, Clone)]
++struct PieceSurface {
++    map: String,
++    material: String,
++    plain: Handle<Mesh>,
++}
++
++#[derive(Clone)]
++struct RegisteredPart {
++    mesh: Handle<Mesh>,
++    surface: PieceSurface,
++}
++
++fn register(piece: &PieceFile, meshes: &mut Assets<Mesh>, registry: &mut PrefabRegistry) {
++    let parts: Vec<RegisteredPart> = piece
++        .parts
++        .iter()
++        .map(|part| {
++            let (mesh, plain) = part.meshes();
++            RegisteredPart {
++                mesh: meshes.add(mesh),
++                surface: PieceSurface { map: piece.map.clone(), material: part.material.clone(), plain: meshes.add(plain) },
++            }
++        })
++        .collect();
++    registry.register(piece.name.clone(), move |entity, _| {
++        entity.with_children(|children| {
++            for part in &parts {
++                children.spawn((Mesh3d(part.mesh.clone()), part.surface.clone(), Transform::default()));
++            }
++        });
++    });
++}
++
++fn load_saved(mut meshes: ResMut<Assets<Mesh>>, mut registry: ResMut<PrefabRegistry>) {
++    let Ok(files) = std::fs::read_dir(pieces_dir()) else { return };
++    for path in files.flatten().map(|f| f.path()) {
++        if !path.to_string_lossy().ends_with(".piece.json") {
++            continue;
++        }
++        match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|bytes| {
++            serde_json::from_slice::<PieceFile>(&bytes).map_err(|e| e.to_string())
++        }) {
++            Ok(piece) => register(&piece, &mut meshes, &mut registry),
++            Err(error) => warn!("map editor: skipping {}: {error}", path.display()),
++        }
++    }
++}
++
++/// Gives placed pieces their world material once the map's world exists, or a
++/// plain one on another map.
++fn dress_surfaces(
++    mut commands: Commands,
++    surfaces: Query<(Entity, &PieceSurface), (Without<MeshMaterial3d<WorldMaterial>>, Without<MeshMaterial3d<StandardMaterial>>)>,
++    world: Query<(&Name, &MeshMaterial3d<WorldMaterial>), Without<PieceSurface>>,
++    map: Res<crate::map_transition::CurrentMap>,
++    mut plain: Local<Option<Handle<StandardMaterial>>>,
++    mut materials: ResMut<Assets<StandardMaterial>>,
++    mut waited: Local<u32>,
++) {
++    if surfaces.is_empty() {
++        *waited = 0;
++        return;
++    }
++    let world: HashMap<&str, &Handle<WorldMaterial>> = world.iter().map(|(name, m)| (name.as_str(), &m.0)).collect();
++    // Placed before the world finished spawning: give it a few seconds.
++    *waited += 1;
++    let world_ready = !world.is_empty() || *waited > 600;
++    let plain = plain
++        .get_or_insert_with(|| materials.add(StandardMaterial { base_color: Color::srgb(0.62, 0.6, 0.57), perceptual_roughness: 0.9, ..default() }))
++        .clone();
++    for (entity, surface) in &surfaces {
++        if surface.map == map.name
++            && let Some(material) = world.get(surface.material.as_str())
++        {
++            commands.entity(entity).insert(MeshMaterial3d((*material).clone()));
++        } else if surface.map != map.name || world_ready {
++            commands.entity(entity).insert((Mesh3d(surface.plain.clone()), MeshMaterial3d(plain.clone())));
++        }
++    }
++}
++
++#[allow(clippy::too_many_arguments)]
++fn copy_picked(
++    mut picks: MessageReader<UnresolvedPick>,
++    mut actions: MessageWriter<EditorAction>,
++    world: Query<(Entity, &Name, &Mesh3d, &GlobalTransform, Option<&Aabb>), (With<MeshMaterial3d<WorldMaterial>>, Without<PieceSurface>)>,
++    mut meshes: ResMut<Assets<Mesh>>,
++    mut registry: ResMut<PrefabRegistry>,
++    map: Res<crate::map_transition::CurrentMap>,
++) {
++    for pick in picks.read() {
++        if !world.contains(pick.entity) {
++            actions.write(EditorAction::SetStatus(
++                "That object is drawn by the game itself, not part of the map, so it can't be copied".into(),
++            ));
++            continue;
++        }
++        let sources: Vec<Source> = world
++            .iter()
++            .filter(|(.., global, aabb)| near(pick.point, global, *aabb))
++            .filter_map(|(entity, name, mesh, global, _)| {
++                Source::new(entity, name.as_str(), meshes.get(&mesh.0)?, global)
++            })
++            .collect();
++        let piece = match extract(&sources, pick.entity, pick.point) {
++            Ok(parts) => parts,
++            Err(error) => {
++                actions.write(EditorAction::SetStatus(error));
++                continue;
++            }
++        };
++        let number = next_number(&map.name);
++        let piece = PieceFile { version: 1, name: format!("{} piece {number}", map.name), map: map.name.clone(), parts: piece };
++        let path = pieces_dir().join(format!("{}_{number}.piece.json", crate::map_editor::layout_name(&map.name)));
++        let saved = std::fs::create_dir_all(pieces_dir())
++            .and_then(|_| std::fs::write(&path, serde_json::to_vec(&piece).unwrap_or_default()));
++        if let Err(error) = saved {
++            warn!("map editor: could not save {}: {error}", path.display());
++        }
++        register(&piece, &mut meshes, &mut registry);
++        let triangles: usize = piece.parts.iter().map(|p| p.indices.len() / 3).sum();
++        let mut data = PropData::new(PropSource::Prefab(piece.name.clone()));
++        data.name = piece.name.clone();
++        actions.write(EditorAction::AddPicked(LibraryEntry {
++            group: LibraryGroup::Picked,
++            label: piece.name.clone(),
++            hint: format!("Copied from {} ({triangles} triangles)", map.name),
++            data,
++        }));
++    }
++}
++
++fn near(point: Vec3, global: &GlobalTransform, aabb: Option<&Aabb>) -> bool {
++    let Some(aabb) = aabb else { return true };
++    let center = global.transform_point(Vec3::from(aabb.center));
++    let half = Vec3::from(aabb.half_extents) * global.scale().abs();
++    let closest = point.clamp(center - half, center + half);
++    closest.distance(point) <= SEARCH_RADIUS
++}
++
++fn next_number(map: &str) -> u32 {
++    let prefix = format!("{}_", crate::map_editor::layout_name(map));
++    std::fs::read_dir(pieces_dir())
++        .into_iter()
++        .flatten()
++        .flatten()
++        .filter_map(|f| {
++            let name = f.file_name().to_string_lossy().into_owned();
++            name.strip_prefix(&prefix)?.strip_suffix(".piece.json")?.parse::<u32>().ok()
++        })
++        .max()
++        .map_or(1, |n| n + 1)
++}
++
++/// One world mesh, in world space.
++struct Source<'a> {
++    entity: Entity,
++    material: String,
++    mesh: &'a Mesh,
++    world: Affine3A,
++    positions: Vec<Vec3>,
++    indices: Vec<u32>,
++}
++
++impl<'a> Source<'a> {
++    fn new(entity: Entity, material: &str, mesh: &'a Mesh, global: &GlobalTransform) -> Option<Self> {
++        let world = global.affine();
++        let positions = mesh.attribute(Mesh::ATTRIBUTE_POSITION)?.as_float3()?;
++        let positions: Vec<Vec3> = positions.iter().map(|p| world.transform_point3(Vec3::from_array(*p))).collect();
++        let indices: Vec<u32> = match mesh.indices() {
++            Some(indices) => indices.iter().map(|i| i as u32).collect(),
++            None => (0..positions.len() as u32).collect(),
++        };
++        Some(Self { entity, material: material.to_owned(), mesh, world, positions, indices })
++    }
++
++    fn triangle(&self, t: usize) -> [Vec3; 3] {
++        [0, 1, 2].map(|k| self.positions[self.indices[t * 3 + k] as usize])
++    }
++
++    fn triangles(&self) -> usize {
++        self.indices.len() / 3
++    }
++}
++
++/// Triangle `t` of source `s`.
++type Id = (u32, u32);
++
++/// Cuts the object around `point` (on `hit`) out of the world meshes.
++fn extract(sources: &[Source], hit: Entity, point: Vec3) -> Result<Vec<PiecePart>, String> {
++    let too_big = "That's part of something big (the ground, a wall or a building). Pick a smaller object: \
++                   a bench, rail, ledge, ramp, bin or sign"
++        .to_string();
++    let hit_source = sources.iter().position(|s| s.entity == hit).ok_or("That mesh isn't loaded")? as u32;
++    let source = &sources[hit_source as usize];
++    let seed = (0..source.triangles())
++        .min_by(|a, b| {
++            let distance = |t| closest_on_triangle(point, source.triangle(t)).distance_squared(point);
++            distance(*a).total_cmp(&distance(*b))
++        })
++        .ok_or("That mesh has no triangles")?;
++
++    // Triangles sharing a vertex position are connected, across meshes too
++    // (an object with two materials is split over two slabs).
++    let mut shared: HashMap<IVec3, Vec<Id>> = HashMap::new();
++    for (s, source) in sources.iter().enumerate() {
++        for t in 0..source.triangles() {
++            for v in source.triangle(t) {
++                shared.entry(weld(v)).or_default().push((s as u32, t as u32));
++            }
++        }
++    }
++    let flood = |start: Id| -> (Vec<Id>, bool) {
++        let mut seen = HashSet::from([start]);
++        let mut queue = VecDeque::from([start]);
++        let mut found = Vec::new();
++        let mut bounds = Bounds::default();
++        while let Some(id) = queue.pop_front() {
++            found.push(id);
++            let triangle = sources[id.0 as usize].triangle(id.1 as usize);
++            for v in triangle {
++                bounds.add(v);
++            }
++            if found.len() > MAX_TRIANGLES || bounds.extent().max_element() > MAX_EXTENT {
++                return (found, false);
++            }
++            for v in triangle {
++                for next in &shared[&weld(v)] {
++                    if seen.insert(*next) {
++                        queue.push_back(*next);
++                    }
++                }
++            }
++        }
++        (found, true)
++    };
++
++    let (first, fits) = flood((hit_source, seed as u32));
++    if !fits {
++        return Err(too_big);
++    }
++    let mut taken: HashSet<Id> = first.into_iter().collect();
++    // Loose parts in the same spot belong to the same object.
++    let mut rejected: HashSet<Id> = HashSet::new();
++    for _ in 0..3 {
++        let bounds = Bounds::of(sources, &taken);
++        let (inner, outer) = (bounds.grown(0.1), bounds.grown(0.5));
++        let mut grew = false;
++        for (s, source) in sources.iter().enumerate() {
++            for t in 0..source.triangles() {
++                let id = (s as u32, t as u32);
++                if taken.contains(&id) || rejected.contains(&id) {
++                    continue;
++                }
++                let [a, b, c] = source.triangle(t);
++                if !inner.contains((a + b + c) / 3.) {
++                    continue;
++                }
++                let (part, fits) = flood(id);
++                if fits && outer.contains_bounds(&Bounds::of(sources, &part)) {
++                    taken.extend(part);
++                    grew = true;
++                } else {
++                    rejected.extend(part);
++                }
++            }
++        }
++        if !grew {
++            break;
++        }
++    }
++
++    // Origin at the bottom centre, so the copy sits on whatever it's placed on.
++    let bounds = Bounds::of(sources, &taken);
++    let origin = Vec3::new((bounds.min.x + bounds.max.x) / 2., bounds.min.y, (bounds.min.z + bounds.max.z) / 2.);
++    let mut by_source: HashMap<u32, Vec<u32>> = HashMap::new();
++    for (s, t) in taken {
++        by_source.entry(s).or_default().push(t);
++    }
++    let mut parts: Vec<PiecePart> = by_source
++        .into_iter()
++        .map(|(s, mut triangles)| {
++            triangles.sort_unstable();
++            cut(&sources[s as usize], &triangles, origin)
++        })
++        .collect();
++    parts.sort_by(|a, b| a.material.cmp(&b.material));
++    Ok(parts)
++}
++
++/// The listed triangles of one world mesh as a mesh of their own.
++fn cut(source: &Source, triangles: &[u32], origin: Vec3) -> PiecePart {
++    let mesh = source.mesh;
++    let mut remap: HashMap<u32, u32> = HashMap::new();
++    let mut order: Vec<u32> = Vec::new();
++    let mut indices = Vec::with_capacity(triangles.len() * 3);
++    for &t in triangles {
++        for k in 0..3 {
++            let v = source.indices[t as usize * 3 + k];
++            let next = order.len() as u32;
++            let index = *remap.entry(v).or_insert(next);
++            if index == next {
++                order.push(v);
++            }
++            indices.push(index);
++        }
++    }
++    let rotate = |v: Vec3| source.world.transform_vector3(v).normalize_or_zero();
++    let pick = |attribute: MeshVertexAttribute| mesh.attribute(attribute);
++    let f2 = |id| match pick(id) {
++        Some(VertexAttributeValues::Float32x2(values)) => order.iter().map(|&v| values[v as usize]).collect(),
++        _ => Vec::new(),
++    };
++    PiecePart {
++        material: source.material.clone(),
++        positions: order.iter().map(|&v| (source.positions[v as usize] - origin).to_array()).collect(),
++        normals: match pick(Mesh::ATTRIBUTE_NORMAL) {
++            Some(VertexAttributeValues::Float32x3(values)) => {
++                order.iter().map(|&v| rotate(Vec3::from_array(values[v as usize])).to_array()).collect()
++            }
++            _ => Vec::new(),
++        },
++        uv0: f2(Mesh::ATTRIBUTE_UV_0),
++        uv1: f2(Mesh::ATTRIBUTE_UV_1),
++        color: match pick(Mesh::ATTRIBUTE_COLOR) {
++            Some(VertexAttributeValues::Float32x4(values)) => order.iter().map(|&v| values[v as usize]).collect(),
++            _ => Vec::new(),
++        },
++        material_index: match pick(ATTRIBUTE_MATERIAL_INDEX) {
++            Some(VertexAttributeValues::Uint32(values)) => order.iter().map(|&v| values[v as usize]).collect(),
++            _ => Vec::new(),
++        },
++        tangents: match pick(Mesh::ATTRIBUTE_TANGENT) {
++            Some(VertexAttributeValues::Float32x4(values)) => order
++                .iter()
++                .map(|&v| {
++                    let [x, y, z, w] = values[v as usize];
++                    rotate(Vec3::new(x, y, z)).extend(w).to_array()
++                })
++                .collect(),
++            _ => Vec::new(),
++        },
++        indices,
++    }
++}
++
++fn weld(v: Vec3) -> IVec3 {
++    (v * WELD).round().as_ivec3()
++}
++
++#[derive(Clone, Copy)]
++struct Bounds {
++    min: Vec3,
++    max: Vec3,
++}
++
++impl Default for Bounds {
++    fn default() -> Self {
++        Self { min: Vec3::INFINITY, max: Vec3::NEG_INFINITY }
++    }
++}
++
++impl Bounds {
++    fn of<'a>(sources: &[Source], ids: impl IntoIterator<Item = &'a Id>) -> Self {
++        let mut bounds = Self::default();
++        for id in ids {
++            for v in sources[id.0 as usize].triangle(id.1 as usize) {
++                bounds.add(v);
++            }
++        }
++        bounds
++    }
++    fn add(&mut self, v: Vec3) {
++        self.min = self.min.min(v);
++        self.max = self.max.max(v);
++    }
++    fn extent(&self) -> Vec3 {
++        (self.max - self.min).max(Vec3::ZERO)
++    }
++    fn grown(&self, by: f32) -> Self {
++        Self { min: self.min - by, max: self.max + by }
++    }
++    fn contains(&self, v: Vec3) -> bool {
++        v.cmpge(self.min).all() && v.cmple(self.max).all()
++    }
++    fn contains_bounds(&self, other: &Self) -> bool {
++        self.contains(other.min) && self.contains(other.max)
++    }
++}
++
++/// Closest point to `p` on triangle `[a, b, c]` (Ericson, Real-Time Collision Detection 5.1.5).
++fn closest_on_triangle(p: Vec3, [a, b, c]: [Vec3; 3]) -> Vec3 {
++    let (ab, ac, ap) = (b - a, c - a, p - a);
++    let (d1, d2) = (ab.dot(ap), ac.dot(ap));
++    if d1 <= 0. && d2 <= 0. {
++        return a;
++    }
++    let bp = p - b;
++    let (d3, d4) = (ab.dot(bp), ac.dot(bp));
++    if d3 >= 0. && d4 <= d3 {
++        return b;
++    }
++    let vc = d1 * d4 - d3 * d2;
++    if vc <= 0. && d1 >= 0. && d3 <= 0. {
++        return a + ab * (d1 / (d1 - d3));
++    }
++    let cp = p - c;
++    let (d5, d6) = (ab.dot(cp), ac.dot(cp));
++    if d6 >= 0. && d5 <= d6 {
++        return c;
++    }
++    let vb = d5 * d2 - d1 * d6;
++    if vb <= 0. && d2 >= 0. && d6 <= 0. {
++        return a + ac * (d2 / (d2 - d6));
++    }
++    let va = d3 * d6 - d5 * d4;
++    if va <= 0. && (d4 - d3) >= 0. && (d5 - d6) >= 0. {
++        return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
++    }
++    let denom = 1. / (va + vb + vc);
++    a + ab * (vb * denom) + ac * (vc * denom)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// A box's triangles, as a world mesh would hold them (its own vertices).
++    fn push_box(positions: &mut Vec<[f32; 3]>, indices: &mut Vec<u32>, center: Vec3, half: Vec3) {
++        let mesh: Mesh = Cuboid::from_size(half * 2.).into();
++        let base = positions.len() as u32;
++        let VertexAttributeValues::Float32x3(p) = mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap() else { panic!() };
++        positions.extend(p.iter().map(|v| (Vec3::from_array(*v) + center).to_array()));
++        indices.extend(mesh.indices().unwrap().iter().map(|i| i as u32 + base));
++    }
++
++    fn world_mesh(boxes: &[(Vec3, Vec3)]) -> Mesh {
++        let (mut positions, mut indices) = (Vec::new(), Vec::new());
++        for (center, half) in boxes {
++            push_box(&mut positions, &mut indices, *center, *half);
++        }
++        let count = positions.len();
++        let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
++            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
++            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0., 1., 0.]; count])
++            .with_inserted_attribute(ATTRIBUTE_MATERIAL_INDEX, vec![7u32; count]);
++        mesh.insert_indices(Indices::U32(indices));
++        mesh
++    }
++
++    #[test]
++    fn copies_one_object_with_its_loose_parts_and_nothing_else() {
++        // Ground (big), a bench made of a seat and two separate legs, and a bin 5 m away.
++        let ground = world_mesh(&[(Vec3::new(0., -0.5, 0.), Vec3::new(50., 0.5, 50.))]);
++        let props = world_mesh(&[
++            (Vec3::new(0., 0.5, 0.), Vec3::new(1., 0.05, 0.3)),   // seat
++            (Vec3::new(-0.9, 0.22, 0.), Vec3::new(0.05, 0.22, 0.25)), // leg
++            (Vec3::new(0.9, 0.22, 0.), Vec3::new(0.05, 0.22, 0.25)),  // leg
++            (Vec3::new(5., 0.5, 0.), Vec3::new(0.3, 0.5, 0.3)),       // bin
++        ]);
++        let mut world = World::new();
++        let (g, p) = (world.spawn_empty().id(), world.spawn_empty().id());
++        let identity = GlobalTransform::IDENTITY;
++        let sources = vec![
++            Source::new(g, "world Opaque slab 0", &ground, &identity).unwrap(),
++            Source::new(p, "world Opaque slab 1", &props, &identity).unwrap(),
++        ];
++
++        // Click the seat.
++        let parts = extract(&sources, p, Vec3::new(0.2, 0.55, 0.)).unwrap();
++        assert_eq!(parts.len(), 1, "only the props mesh");
++        let part = &parts[0];
++        assert_eq!(part.indices.len() / 3, 36, "seat and both legs, no bin");
++        assert!(part.material_index.iter().all(|&m| m == 7));
++        let lowest = part.positions.iter().map(|p| p[1]).fold(f32::MAX, f32::min);
++        assert!(lowest.abs() < 1e-4, "copy sits on its origin");
++        let widest = part.positions.iter().map(|p| p[0].abs()).fold(0., f32::max);
++        assert!((widest - 1.).abs() < 1e-4, "centred under the seat ({widest})");
++
++        // The ground is too big to copy.
++        assert!(extract(&sources, g, Vec3::new(10., 0., 10.)).is_err());
++
++        // Round trip through the saved file.
++        let (mesh, plain) = part.meshes();
++        assert!(mesh.attribute(ATTRIBUTE_MATERIAL_INDEX).is_some());
++        assert!(plain.attribute(ATTRIBUTE_MATERIAL_INDEX).is_none());
++        let json = serde_json::to_vec(&PieceFile { version: 1, name: "t".into(), map: "m".into(), parts }).unwrap();
++        assert_eq!(serde_json::from_slice::<PieceFile>(&json).unwrap().parts[0].indices.len(), 108);
 +    }
 +}
 diff --git a/crates/skate-game/src/modding/editor_solids.rs b/crates/skate-game/src/modding/editor_solids.rs
@@ -1507,10 +2106,10 @@ index 0000000..104ee76
 +serde_json.workspace = true
 diff --git a/crates/skate-map-editor/examples/render_path.rs b/crates/skate-map-editor/examples/render_path.rs
 new file mode 100644
-index 0000000..1a431ec
+index 0000000..fe263e7
 --- /dev/null
 +++ b/crates/skate-map-editor/examples/render_path.rs
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,165 @@
 +//! The Skate 3 Rust Engine render path, with the editor in it: the game's 3D camera draws into
 +//! an offscreen image at a lower internal resolution, and a 2D camera puts that image on screen.
 +//!
@@ -1645,7 +2244,8 @@ index 0000000..1a431ec
 +            // Put the mouse over the cube: where it is in the half-size image, doubled for the window.
 +            let (camera, transform) = *editor_view;
 +            let in_view = camera.world_to_viewport(transform, Vec3::new(3.0, 0.5, 0.0)).unwrap();
-+            window.set_cursor_position(Some(in_view * window.size() / Vec2::new(640.0, 360.0)));
++            let size = window.size();
++            window.set_cursor_position(Some(in_view * size / Vec2::new(640.0, 360.0)));
 +        }
 +        66 => {
 +            let cube = props.iter().position(|p| p.source == PropSource::Primitive(Primitive::Cube));
@@ -1677,13 +2277,14 @@ index 0000000..1a431ec
 +}
 diff --git a/crates/skate-map-editor/src/camera.rs b/crates/skate-map-editor/src/camera.rs
 new file mode 100644
-index 0000000..647bc12
+index 0000000..77975cc
 --- /dev/null
 +++ b/crates/skate-map-editor/src/camera.rs
-@@ -0,0 +1,273 @@
+@@ -0,0 +1,294 @@
 +//! Editor free camera, and handing control between it and the game's own camera.
 +
 +use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
++use bevy::camera::RenderTarget;
 +use bevy::prelude::*;
 +use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 +use bevy_egui::EguiMultipassSchedule;
@@ -1741,6 +2342,8 @@ index 0000000..647bc12
 +        Name::new("Map Editor UI Camera"),
 +        EditorUiCamera,
 +        Camera2d,
++        // Cameras drawing to the same window must agree on MSAA; set on open to match the game's.
++        Msaa::Off,
 +        Camera {
 +            order: 10_000,
 +            is_active: false,
@@ -1779,26 +2382,35 @@ index 0000000..647bc12
 +fn enter_editor(
 +    mut handoff: ResMut<Handoff>,
 +    mut game_cams: Query<
-+        (Entity, &mut Camera, &GlobalTransform, &Transform, Option<&Projection>, Has<Camera3d>),
++        (
++            Entity,
++            &mut Camera,
++            &GlobalTransform,
++            &Transform,
++            Option<&Projection>,
++            Has<Camera3d>,
++            (Option<&RenderTarget>, Option<&Msaa>),
++        ),
 +        (Without<EditorCamera>, Without<EditorUiCamera>),
 +    >,
 +    editor_cam: Single<
 +        (&mut Camera, &mut Transform, &mut Projection, &mut EditorCamera),
 +        With<EditorCamera>,
 +    >,
-+    mut ui_cam: Single<&mut Camera, (With<EditorUiCamera>, Without<EditorCamera>)>,
++    ui_cam: Single<(&mut Camera, &mut Msaa), (With<EditorUiCamera>, Without<EditorCamera>)>,
 +    mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
 +    mut time: ResMut<Time<Virtual>>,
 +    settings: Res<MapEditorSettings>,
 +) {
++    let (mut ui_camera, mut ui_msaa) = ui_cam.into_inner();
 +    let (mut ed_camera, mut ed_transform, mut ed_projection, mut ed) = editor_cam.into_inner();
 +
 +    // Start the free camera exactly where the game's main 3D camera is.
 +    let source = game_cams
 +        .iter()
-+        .filter(|(_, cam, _, _, _, is_3d)| cam.is_active && *is_3d)
++        .filter(|(_, cam, _, _, _, is_3d, _)| cam.is_active && *is_3d)
 +        .max_by_key(|(_, cam, ..)| cam.order)
-+        .map(|(_, _, global, local, projection, _)| {
++        .map(|(_, _, global, local, projection, ..)| {
 +            let transform = if *global == GlobalTransform::IDENTITY {
 +                *local
 +            } else {
@@ -1821,14 +2433,23 @@ index 0000000..647bc12
 +    // Switch the game's 3D cameras off and remember which ones were on. 2D cameras stay:
 +    // they may be what puts the game's (now the editor's) picture on the screen.
 +    handoff.game_cameras.clear();
-+    for (entity, mut cam, .., is_3d) in &mut game_cams {
++    for (entity, mut cam, .., is_3d, _) in &mut game_cams {
 +        if cam.is_active && is_3d {
 +            cam.is_active = false;
 +            handoff.game_cameras.push(entity);
 +        }
 +    }
 +    ed_camera.is_active = true;
-+    ui_cam.is_active = true;
++    ui_camera.is_active = true;
++    // The UI camera shares the window with whatever game camera still draws there.
++    *ui_msaa = game_cams
++        .iter()
++        .filter(|(_, cam, .., (target, _))| {
++            cam.is_active && matches!(target, None | Some(RenderTarget::Window(_)))
++        })
++        .max_by_key(|(_, cam, ..)| cam.order)
++        .map(|(.., (_, msaa))| msaa.copied().unwrap_or_default())
++        .unwrap_or(Msaa::Off);
 +
 +    if let Ok(mut cursor) = cursor.single_mut() {
 +        handoff.cursor = Some((cursor.visible, cursor.grab_mode));
@@ -1956,10 +2577,10 @@ index 0000000..647bc12
 +}
 diff --git a/crates/skate-map-editor/src/editor.rs b/crates/skate-map-editor/src/editor.rs
 new file mode 100644
-index 0000000..85b2416
+index 0000000..705e1ce
 --- /dev/null
 +++ b/crates/skate-map-editor/src/editor.rs
-@@ -0,0 +1,1029 @@
+@@ -0,0 +1,1061 @@
 +//! Editor behaviour: placing, selecting, moving, undo, save/load.
 +
 +use std::path::{Path, PathBuf};
@@ -1971,7 +2592,7 @@ index 0000000..85b2416
 +use bevy::window::{FileDragAndDrop, PrimaryWindow};
 +
 +use crate::camera::EditorCamera;
-+use crate::library::{Eyedropper, Library};
++use crate::library::{Eyedropper, Library, LibraryEntry};
 +use crate::props::{CollisionKind, Ghost, MapFile, Prop, PropData, PropMaterial, PropSource, PropSpawner};
 +use crate::{EditorMode, MapEditorSettings, StartupConfig, assets_root, editor_open, maps_dir};
 +use crate::props::is_gltf_path;
@@ -2009,6 +2630,22 @@ index 0000000..85b2416
 +    StartPicking,
 +    /// Copy this game-world entity (or the object it belongs to) into the library and start placing it.
 +    PickFrom(Entity),
++    /// Add an entry to "Picked from the world" and start placing it (the game's answer to an
++    /// [`UnresolvedPick`]).
++    AddPicked(LibraryEntry),
++    /// Show a message in the status bar.
++    SetStatus(String),
++}
++
++/// The eyedropper hit something with no asset file behind it (a mesh the game built in code).
++/// Sent when [`crate::MapEditorPlugin::handles_unresolved_picks`] is on; answer with
++/// [`EditorAction::AddPicked`] or [`EditorAction::SetStatus`].
++#[derive(Message, Clone, Debug)]
++pub struct UnresolvedPick {
++    /// The mesh entity under the cursor.
++    pub entity: Entity,
++    /// Where the cursor ray hit it, in world space.
++    pub point: Vec3,
 +}
 +
 +/// Shorthand for loading a map from game code: `commands.write_message(LoadMap("level2".into()))`.
@@ -2034,6 +2671,7 @@ index 0000000..85b2416
 +    pub(crate) undo: Vec<Vec<PropData>>,
 +    pub(crate) redo: Vec<Vec<PropData>>,
 +    pub(crate) picking: bool,
++    pub(crate) pick_point: Option<Vec3>,
 +}
 +
 +impl Default for EditorState {
@@ -2052,6 +2690,7 @@ index 0000000..85b2416
 +            undo: Vec::new(),
 +            redo: Vec::new(),
 +            picking: false,
++            pick_point: None,
 +        }
 +    }
 +}
@@ -2086,6 +2725,7 @@ index 0000000..85b2416
 +        app.init_resource::<EditorState>()
 +            .add_message::<EditorAction>()
 +            .add_message::<LoadMap>()
++            .add_message::<UnresolvedPick>()
 +            .add_systems(Startup, startup_library)
 +            .add_systems(OnExit(EditorMode::Editing), leave_editor)
 +            .add_systems(
@@ -2442,6 +3082,7 @@ index 0000000..85b2416
 +        if buttons.just_pressed(MouseButton::Left) && !state.pointer_over_ui && !state.looking {
 +            match hit {
 +                Some(hit) if hit.prop.is_none() => {
++                    state.pick_point = Some(hit.point);
 +                    actions.write(EditorAction::PickFrom(hit.entity));
 +                }
 +                Some(_) => state.status = "That's already a map prop: select it and Duplicate instead".into(),
@@ -2637,6 +3278,7 @@ index 0000000..85b2416
 +    mut pending: Local<std::collections::VecDeque<EditorAction>>,
 +    mut library: ResMut<Library>,
 +    eyedropper: Eyedropper,
++    mut unresolved: MessageWriter<UnresolvedPick>,
 +) {
 +    pending.extend(actions.read().cloned());
 +    while let Some(action) = pending.pop_front() {
@@ -2698,20 +3340,31 @@ index 0000000..85b2416
 +
 +            EditorAction::PickFrom(entity) => {
 +                state.picking = false;
++                let point = state.pick_point.take();
 +                match eyedropper.pick(entity) {
-+                    Ok(entry) => {
-+                        state.status = format!("Picked {} — click in the world to place copies", entry.label);
-+                        let data = entry.data.clone();
-+                        library.picked.retain(|e| e.data.source != entry.data.source);
-+                        library.picked.insert(0, entry);
-+                        if let Some(ghost) = state.placing.take().and_then(|p| p.ghost) {
-+                            spawner.commands.entity(ghost).despawn();
-+                        }
-+                        state.placing = Some(Placing { data, ghost: None, from_drag: false, yaw: 0.0 });
++                    Ok(entry) => pending.push_front(EditorAction::AddPicked(entry)),
++                    Err(_) if settings.handles_unresolved_picks && point.is_some() => {
++                        state.status = "Copying that object...".into();
++                        unresolved.write(UnresolvedPick { entity, point: point.unwrap() });
 +                    }
 +                    Err(e) => state.status = e,
 +                }
 +            }
++
++            EditorAction::AddPicked(entry) => {
++                state.picking = false;
++                state.status = format!("Picked {}: click in the world to place copies", entry.label);
++                let data = entry.data.clone();
++                library.picked.retain(|e| e.data.source != entry.data.source);
++                library.picked.insert(0, entry);
++                if let Some(ghost) = state.placing.take().and_then(|p| p.ghost) {
++                    spawner.commands.entity(ghost).despawn();
++                }
++                state.selected = None;
++                state.placing = Some(Placing { data, ghost: None, from_drag: false, yaw: 0.0 });
++            }
++
++            EditorAction::SetStatus(status) => state.status = status,
 +
 +            EditorAction::Delete => {
 +                if let Some(entity) = state.selected.take()
@@ -2991,10 +3644,10 @@ index 0000000..85b2416
 +}
 diff --git a/crates/skate-map-editor/src/lib.rs b/crates/skate-map-editor/src/lib.rs
 new file mode 100644
-index 0000000..ee47238
+index 0000000..05871b3
 --- /dev/null
 +++ b/crates/skate-map-editor/src/lib.rs
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,222 @@
 +//! # bevy_map_editor
 +//!
 +//! A drop-in, in-game map editor for any Bevy 3D game.
@@ -3027,7 +3680,7 @@ index 0000000..ee47238
 +use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 +
 +pub use camera::{EditorCamera, EditorUiCamera};
-+pub use editor::{EditorAction, EditorState, LoadMap};
++pub use editor::{EditorAction, EditorState, LoadMap, UnresolvedPick};
 +pub use library::{Library, LibraryEntry, LibraryGroup, MapEditorAppExt, PrefabRegistry};
 +pub use props::{CollisionKind, Ghost, MapFile, MeshPart, Primitive, Prop, PropData, PropSource, PropSpawned};
 +
@@ -3050,6 +3703,14 @@ index 0000000..ee47238
 +    pub assets_dir: Option<PathBuf>,
 +    /// Where maps are saved, if not `<assets>/maps`.
 +    pub maps_dir: Option<PathBuf>,
++    /// Only list files from these folders of the assets folder under "Game files" (e.g.
++    /// `["imported"]`). `None` lists the whole assets folder.
++    pub file_folders: Option<Vec<String>>,
++    /// List what the running game has loaded ("Loaded by the game").
++    pub show_loaded: bool,
++    /// The game resolves eyedropper picks the editor can't (objects with no asset file): the
++    /// editor sends [`UnresolvedPick`] and the game answers with [`EditorAction::AddPicked`].
++    pub handles_unresolved_picks: bool,
 +}
 +
 +impl Default for MapEditorPlugin {
@@ -3062,6 +3723,9 @@ index 0000000..ee47238
 +            model_extensions: Vec::new(),
 +            assets_dir: None,
 +            maps_dir: None,
++            file_folders: None,
++            show_loaded: true,
++            handles_unresolved_picks: false,
 +        }
 +    }
 +}
@@ -3099,6 +3763,12 @@ index 0000000..ee47238
 +    pub show_colliders_hint: bool,
 +    /// Lower-case extensions (without the dot) scanned for in the assets folder.
 +    pub model_extensions: Vec<String>,
++    /// See [`MapEditorPlugin::file_folders`].
++    pub file_folders: Option<Vec<String>>,
++    /// See [`MapEditorPlugin::show_loaded`].
++    pub show_loaded: bool,
++    /// See [`MapEditorPlugin::handles_unresolved_picks`].
++    pub handles_unresolved_picks: bool,
 +}
 +
 +impl Default for MapEditorSettings {
@@ -3114,6 +3784,9 @@ index 0000000..ee47238
 +            show_grid: true,
 +            show_colliders_hint: true,
 +            model_extensions: vec!["glb".into(), "gltf".into()],
++            file_folders: None,
++            show_loaded: true,
++            handles_unresolved_picks: false,
 +        }
 +    }
 +}
@@ -3170,6 +3843,9 @@ index 0000000..ee47238
 +        let mut settings = MapEditorSettings {
 +            toggle_key: self.toggle_key,
 +            pause_game: self.pause_game,
++            file_folders: self.file_folders.clone(),
++            show_loaded: self.show_loaded,
++            handles_unresolved_picks: self.handles_unresolved_picks,
 +            ..default()
 +        };
 +        for ext in &self.model_extensions {
@@ -3196,10 +3872,10 @@ index 0000000..ee47238
 +}
 diff --git a/crates/skate-map-editor/src/library.rs b/crates/skate-map-editor/src/library.rs
 new file mode 100644
-index 0000000..dc0e142
+index 0000000..476a629
 --- /dev/null
 +++ b/crates/skate-map-editor/src/library.rs
-@@ -0,0 +1,528 @@
+@@ -0,0 +1,537 @@
 +//! The asset browser's catalogue: everything the host game has to offer.
 +//!
 +//! - **Game prefabs**: objects the game registers in code ([`MapEditorAppExt::register_prefab`]).
@@ -3231,7 +3907,7 @@ index 0000000..dc0e142
 +impl LibraryGroup {
 +    pub fn title(self) -> &'static str {
 +        match self {
-+            LibraryGroup::Prefabs => "Game prefabs",
++            LibraryGroup::Prefabs => "Game objects",
 +            LibraryGroup::Files => "Game files",
 +            LibraryGroup::Loaded => "Loaded by the game",
 +            LibraryGroup::Picked => "Picked from the world",
@@ -3361,7 +4037,7 @@ index 0000000..dc0e142
 +    *last = now;
 +    if library.rescan {
 +        library.rescan = false;
-+        *files = scan_files(&settings.model_extensions);
++        *files = scan_files(&settings.model_extensions, settings.file_folders.as_deref());
 +        library.maps = scan_maps();
 +    }
 +
@@ -3374,7 +4050,9 @@ index 0000000..dc0e142
 +        .collect();
 +    let mut entries = live.prefab_entries();
 +    entries.extend(files.iter().cloned());
-+    entries.extend(live.loaded_entries(&file_paths));
++    if settings.show_loaded {
++        entries.extend(live.loaded_entries(&file_paths));
++    }
 +    library.entries = entries;
 +}
 +
@@ -3387,10 +4065,17 @@ index 0000000..dc0e142
 +// ---------------------------------------------------------------------------------------------
 +// Files on disk
 +
-+pub(crate) fn scan_files(extensions: &[String]) -> Vec<LibraryEntry> {
++pub(crate) fn scan_files(extensions: &[String], folders: Option<&[String]>) -> Vec<LibraryEntry> {
 +    let root = assets_root();
 +    let mut paths = Vec::new();
-+    collect_files(&root, &root, 0, extensions, &mut paths);
++    match folders {
++        Some(folders) => {
++            for folder in folders {
++                collect_files(&root, &root.join(folder), 1, extensions, &mut paths);
++            }
++        }
++        None => collect_files(&root, &root, 0, extensions, &mut paths),
++    }
 +    paths.sort();
 +    paths
 +        .into_iter()
