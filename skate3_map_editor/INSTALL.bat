@@ -12,8 +12,13 @@ where git >nul 2>nul || (
     pause & exit /b 1
 )
 if not exist "%ProgramFiles%\LLVM\bin\llvm-readobj.exe" (
-    echo The game's build needs LLVM. Installing it...
-    winget install -e --id LLVM.LLVM --accept-package-agreements --accept-source-agreements
+    echo The game's build needs LLVM. Installing it, accept the Windows prompt...
+    where winget >nul 2>nul && (
+        winget install -e --id LLVM.LLVM --accept-package-agreements --accept-source-agreements
+    ) || (
+        rem No winget: fetch the official installer from LLVM's GitHub releases and run it silently.
+        powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = 'Tls12'; $ProgressPreference = 'SilentlyContinue'; $release = Invoke-RestMethod 'https://api.github.com/repos/llvm/llvm-project/releases/latest'; $asset = $release.assets | Where-Object { $_.name -like 'LLVM-*-win64.exe' } | Select-Object -First 1; $file = Join-Path $env:TEMP $asset.name; Write-Host ('Downloading ' + $asset.name); Invoke-WebRequest $asset.browser_download_url -OutFile $file; Start-Process $file -ArgumentList '/S' -Verb RunAs -Wait"
+    )
     if not exist "%ProgramFiles%\LLVM\bin\llvm-readobj.exe" (
         echo Install LLVM from https://github.com/llvm/llvm-project/releases in its default folder, then run this again.
         pause & exit /b 1
