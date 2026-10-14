@@ -27,6 +27,10 @@ Then:
 
 Your normal `skate3rust.exe` is untouched and still updates as usual.
 
+The build itself happens in `%LOCALAPPDATA%\sk8t` (around 10 GB), because Windows build tools fail
+on paths over 260 characters and game folders in Downloads are deep. You can delete that folder
+after a build; the next build just takes longer.
+
 ## Using it
 
 | | |

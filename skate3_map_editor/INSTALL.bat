@@ -33,7 +33,14 @@ if exist "crates\skate-map-editor\Cargo.toml" (
     git -c user.name=map-editor -c user.email=map-editor@localhost commit -q -m "Add the map editor" || (popd & pause & exit /b 1)
     git reset -q --hard
 )
-call BUILD.bat || (popd & pause & exit /b 1)
+rem MSBuild cannot write paths over 260 characters, and this folder can be deep
+rem (Downloads\...\skate-3-rust-engine\target\...), so compile in a short folder.
+rem The finished game is still copied to skate-3-rust-engine\bin for PLAY.bat.
+set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "scripts\Build.ps1" -TargetDirectory "%LOCALAPPDATA%\sk8t" || (
+    echo Build failed; see the messages above.
+    popd & pause & exit /b 1
+)
 popd
 echo.
 echo Done. Start the game with skate-3-rust-engine\PLAY.bat and press F1 for the map editor.
